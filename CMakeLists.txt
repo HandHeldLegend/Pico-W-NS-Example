@@ -35,7 +35,9 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(Pico-W-NS-Example Pico-W-NS-Example.c )
+add_executable(Pico-W-NS-Example
+    main.c 
+)
 
 pico_set_program_name(Pico-W-NS-Example "Pico-W-NS-Example")
 pico_set_program_version(Pico-W-NS-Example "0.1")
@@ -48,15 +50,41 @@ pico_enable_stdio_usb(Pico-W-NS-Example 0)
 target_link_libraries(Pico-W-NS-Example
         pico_stdlib)
 
+# Disable LWIP
+target_compile_definitions(Pico-W-NS-Example
+  INTERFACE
+  CYW43_LWIP=0
+)
+
 # Add the standard include files to the build
 target_include_directories(Pico-W-NS-Example PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
 
-# Add any user requested libraries
+# Import NS-LIB-HID library
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/external/NS-LIB-HID")
+
+# Add the NS-LIB-HID library
+target_link_libraries(Pico-W-NS-Example
+    ns_lib_hid
+)
+
+# Add USB related libraries
 target_link_libraries(Pico-W-NS-Example 
-        pico_cyw43_arch_lwip_threadsafe_background
-        )
+    tinyusb_device
+    tinyusb_board
+)
+
+# Add wireless networking libraries
+target_link_libraries(Pico-W-NS-Example 
+    pico_cyw43_arch_lwip_threadsafe_background 
+    pico_cyw43_driver 
+    pico_btstack_cyw43 
+    pico_btstack_hci_transport_cyw43 
+    pico_btstack_flash_bank
+    pico_btstack_ble 
+    pico_btstack_classic 
+)
 
 pico_add_extra_outputs(Pico-W-NS-Example)
 
