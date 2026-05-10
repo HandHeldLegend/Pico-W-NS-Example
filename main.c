@@ -1,4 +1,4 @@
-#include <stdio.h>
+#include "main.h"
 
 #include "ns_lib.h"
 #include "pico/stdlib.h"
@@ -36,7 +36,7 @@ int main()
 
     ns_device_config_s config = {
         .colors = colors,
-        .device_mac = device_mac,
+        .device_mac = {0},
         .host_mac = {0}, // Host data is optional
         .gyro_full_scale_dps = 2000, // DPS scale of your gyro sensor if used
         .gyro_rad_per_lsb = 0, // This is set automatically when we init the library
@@ -44,9 +44,11 @@ int main()
         .type = NS_DEVTYPE_PROCON, // NS Device Type
     };
 
+    memcpy(config.device_mac, device_mac, 6);
+
     if(ns_lib_init(&config) == NS_CONFIG_OK)
     {
-
+        ns_usb_enter();
     }
 }
 

@@ -79,7 +79,7 @@ target_link_libraries(Pico-W-NS-Example
 
 # Add wireless networking libraries
 target_link_libraries(Pico-W-NS-Example 
-    pico_cyw43_arch_lwip_threadsafe_background 
+    pico_cyw43_arch_none 
     pico_cyw43_driver 
     pico_btstack_cyw43 
     pico_btstack_hci_transport_cyw43 

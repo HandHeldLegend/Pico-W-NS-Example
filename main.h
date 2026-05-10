@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 void ns_usb_enter(void);
 void ns_btc_enter(uint8_t device_mac[6], bool pairing_mode);
