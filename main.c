@@ -5,10 +5,11 @@
 #include "pico/cyw43_arch.h"
 
 #include "hardware/timer.h"
+#include "pico/rand.h"
 
 // Colors can accept RGB Hex values 
 const ns_colordata_s colors = {
-    .body_r = 0,
+    .body_r = 0xFF,
     .body_g = 0, 
     .body_b = 0,
 
@@ -26,7 +27,7 @@ const ns_colordata_s colors = {
 };
 
 // Example device mac address
-const uint8_t device_mac[6] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6};
+const uint8_t device_mac[6] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF2};
 
 int main()
 {
@@ -41,7 +42,7 @@ int main()
         .gyro_full_scale_dps = 2000, // DPS scale of your gyro sensor if used
         .gyro_rad_per_lsb = 0, // This is set automatically when we init the library
         .transport = NS_TRANSPORT_USB,
-        .type = NS_DEVTYPE_PROCON, // NS Device Type
+        .type = NS_DEVTYPE_SNES_JP, // NS Device Type
     };
 
     memcpy(config.device_mac, device_mac, 6);
@@ -142,10 +143,16 @@ void ns_get_inputdata_cb(ns_inputdata_s *out)
     out->rs_y = 2048;
 }
 
-// HAL Time Function
+// HAL time function
 void ns_get_time_ms(uint64_t *ms)
 {
     *ms = time_us_64() / 1000;
+}
+
+// HAL random u8 function
+uint8_t ns_get_random_u8(void)
+{
+    return (uint8_t) (get_rand_32() & 0xFF);
 }
 
 // IMU SENSOR DATA

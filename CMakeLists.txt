@@ -50,7 +50,9 @@ pico_enable_stdio_usb(Pico-W-NS-Example 0)
 
 # Add the standard library to the build
 target_link_libraries(Pico-W-NS-Example
-        pico_stdlib)
+        pico_stdlib
+        pico_rand
+)
 
 # Disable LWIP
 target_compile_definitions(Pico-W-NS-Example
