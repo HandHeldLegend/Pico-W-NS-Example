@@ -7,16 +7,16 @@
 #include "hardware/timer.h"
 #include "pico/rand.h"
 
+static const uint NS_BT_BOOT_PIN = 0;
+static const uint NS_BT_PAIR_BOOT_PIN = 1;
+static const uint NS_A_BUTTON_PIN = 14;
+static const uint NS_B_BUTTON_PIN = 15;
+
 typedef struct
 {
-    uint32_t magic_byte;
-    uint8_t host_mac[6];
-    uint8_t link_key[16];
-} ns_storage_s;
-
-#define NS_STORAGE_MAGIC 0xDEADFEED
-#define NS_STORAGE_SIZE sizeof(ns_storage_s)
-#define NS_STORAGE_PAGE 0
+    ns_transport_t transport;
+    bool pairing_mode;
+} ns_boot_mode_s;
 
 // Colors can accept RGB Hex values 
 const ns_colordata_s colors = {
@@ -39,13 +39,59 @@ const ns_colordata_s colors = {
 
 // Example device mac address
 const uint8_t device_mac[6] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF2};
-static ns_storage_s device_storage = {0};
+ns_storage_s  device_storage = {0};
+
+static void ns_print_debug(uint8_t addr[6], uint8_t link_key[16])
+{
+    printf("Addr: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    printf("Link key: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+    link_key[0], link_key[1], link_key[2], link_key[3], link_key[4], link_key[5], link_key[6], link_key[7],
+    link_key[8], link_key[9], link_key[10], link_key[11], link_key[12], link_key[13], link_key[14], link_key[15]);
+}
+
+static ns_boot_mode_s ns_get_boot_mode(void)
+{
+    ns_boot_mode_s boot_mode = {
+        .transport = NS_TRANSPORT_USB,
+        .pairing_mode = false,
+    };
+
+    gpio_init(NS_BT_BOOT_PIN);
+    gpio_set_dir(NS_BT_BOOT_PIN, GPIO_IN);
+    gpio_pull_up(NS_BT_BOOT_PIN);
+
+    gpio_init(NS_BT_PAIR_BOOT_PIN);
+    gpio_set_dir(NS_BT_PAIR_BOOT_PIN, GPIO_IN);
+    gpio_pull_up(NS_BT_PAIR_BOOT_PIN);
+
+    gpio_init(NS_A_BUTTON_PIN);
+    gpio_set_dir(NS_A_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(NS_A_BUTTON_PIN);
+
+    gpio_init(NS_B_BUTTON_PIN);
+    gpio_set_dir(NS_B_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(NS_B_BUTTON_PIN);
+
+    if (!gpio_get(NS_BT_PAIR_BOOT_PIN))
+    {
+        boot_mode.transport = NS_TRANSPORT_BTC;
+        boot_mode.pairing_mode = true;
+    }
+    else if (!gpio_get(NS_BT_BOOT_PIN))
+    {
+        boot_mode.transport = NS_TRANSPORT_BTC;
+    }
+
+    return boot_mode;
+}
 
 int main()
 {
+    ns_boot_mode_s boot_mode = ns_get_boot_mode();
     stdio_init_all();
     sleep_ms(500);
-    printf("Pico-W Booted.");
+    printf("Pico-W Booted!\n\n");
 
     ns_flash_init();
 
@@ -61,13 +107,15 @@ int main()
         device_storage.magic_byte = NS_STORAGE_MAGIC;
     }
 
+    ns_print_debug(device_storage.host_mac, device_storage.link_key);
+
     ns_device_config_s config = {
         .colors = colors,
         .device_mac = {0},
         .host_mac = {0}, // Host data is optional
         .gyro_full_scale_dps = 2000, // DPS scale of your gyro sensor if used
         .gyro_rad_per_lsb = 0, // This is set automatically when we init the library
-        .transport = NS_TRANSPORT_USB,
+        .transport = boot_mode.transport,
         .type = NS_DEVTYPE_SNES_JP, // NS Device Type
     };
 
@@ -76,7 +124,17 @@ int main()
 
     if(ns_lib_init(&config) == NS_CONFIG_OK)
     {
-        ns_usb_enter();
+        if (boot_mode.transport == NS_TRANSPORT_BTC)
+        {
+            printf("Entering Bluetooth mode (pairing %s)\n",
+                   boot_mode.pairing_mode ? "on" : "off");
+            ns_btc_enter(config.device_mac, boot_mode.pairing_mode);
+        }
+        else
+        {
+            printf("Entering USB mode\n");
+            ns_usb_enter();
+        }
     }
 }
 
@@ -162,8 +220,8 @@ void ns_get_inputdata_cb(ns_inputdata_s *out)
     // or just fill it with input data 
     // that we've already read!
 
-    out->a = 0;
-    out->b = 0;
+    out->a = !gpio_get(NS_A_BUTTON_PIN);
+    out->b = !gpio_get(NS_B_BUTTON_PIN);
 
     // Joystick values are 12 bit unsigned
     out->ls_x = 2048;

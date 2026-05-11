@@ -45,9 +45,12 @@ add_executable(Pico-W-NS-Example
 pico_set_program_name(Pico-W-NS-Example "Pico-W-NS-Example")
 pico_set_program_version(Pico-W-NS-Example "0.1")
 
-# Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(Pico-W-NS-Example 1)
-pico_enable_stdio_usb(Pico-W-NS-Example 0)
+# Keep UART stdio off GPIO0/GPIO1 so they can be used as boot straps.
+target_compile_definitions(Pico-W-NS-Example PRIVATE
+    PICO_DEFAULT_UART=0
+    PICO_DEFAULT_UART_TX_PIN=12
+    PICO_DEFAULT_UART_RX_PIN=13
+)
 
 # Add the standard library to the build
 target_link_libraries(Pico-W-NS-Example
@@ -93,3 +96,6 @@ target_link_libraries(Pico-W-NS-Example
 
 pico_add_extra_outputs(Pico-W-NS-Example)
 
+# Modify the below lines to enable/disable output over UART/USB
+pico_enable_stdio_uart(Pico-W-NS-Example 1)
+pico_enable_stdio_usb(Pico-W-NS-Example 0)
