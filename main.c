@@ -1,3 +1,19 @@
+/**
+ * @file main.c
+ * @brief Example application entry point and NS-LIB-HID callback implementations.
+ *
+ * Author: Mitchell Cairns
+ * Copyright (c) 2026 Hand Held Legend, LLC.
+ *
+ * Licensed under the Creative Commons Attribution-NonCommercial 4.0 International
+ * License (CC BY-NC 4.0). Non-commercial use with attribution; commercial use
+ * requires permission from Hand Held Legend, LLC. Licensing inquiries:
+ * support@handheldlegend.com
+ * Full terms: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+ *
+ * SPDX-License-Identifier: CC-BY-NC-4.0
+ */
+
 #include "main.h"
 
 #include "ns_lib.h"
@@ -12,13 +28,14 @@ static const uint NS_BT_PAIR_BOOT_PIN = 1;
 static const uint NS_A_BUTTON_PIN = 14;
 static const uint NS_B_BUTTON_PIN = 15;
 
+/* Boot mode is chosen once at power-up so the rest of the firmware can stay transport-specific. */
 typedef struct
 {
     ns_transport_t transport;
     bool pairing_mode;
 } ns_boot_mode_s;
 
-// Colors can accept RGB Hex values 
+/* Example SPI color data reported by the library when the host queries controller identity. */
 const ns_colordata_s colors = {
     .body_r = 0xFF,
     .body_g = 0, 
@@ -37,7 +54,7 @@ const ns_colordata_s colors = {
     .r_grip_b = 0,
 };
 
-// Example device mac address
+/* Example controller address used for descriptor identity and Bluetooth bring-up. */
 const uint8_t device_mac[6] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF2};
 ns_storage_s  device_storage = {0};
 
@@ -52,11 +69,13 @@ static void ns_print_debug(uint8_t addr[6], uint8_t link_key[16])
 
 static ns_boot_mode_s ns_get_boot_mode(void)
 {
+    /* Default to wired operation so an unstrapped board always boots into a usable mode. */
     ns_boot_mode_s boot_mode = {
         .transport = NS_TRANSPORT_USB,
         .pairing_mode = false,
     };
 
+    /* GP0/GP1 act as mode straps. The button inputs also use pull-ups, so all inputs are active-low. */
     gpio_init(NS_BT_BOOT_PIN);
     gpio_set_dir(NS_BT_BOOT_PIN, GPIO_IN);
     gpio_pull_up(NS_BT_BOOT_PIN);
@@ -75,11 +94,13 @@ static ns_boot_mode_s ns_get_boot_mode(void)
 
     if (!gpio_get(NS_BT_PAIR_BOOT_PIN))
     {
+        /* Pairing mode implies Bluetooth transport. */
         boot_mode.transport = NS_TRANSPORT_BTC;
         boot_mode.pairing_mode = true;
     }
     else if (!gpio_get(NS_BT_BOOT_PIN))
     {
+        /* Reconnect mode uses any stored pairing material already in flash. */
         boot_mode.transport = NS_TRANSPORT_BTC;
     }
 
@@ -95,12 +116,13 @@ int main()
 
     ns_flash_init();
 
-    // Load flash data storage
+    /* Load the example's persisted host MAC and link key, if they were written previously. */
     ns_flash_read((uint8_t*) &device_storage, NS_STORAGE_SIZE, NS_STORAGE_PAGE);
 
-    // If our magic 32 bit value does not match
-    // initialize the storage magic byte and clear
-    // the entire struct
+    /*
+     * A missing magic value means this sector has never been initialized by the
+     * example, so start with a clean settings block before any pairing occurs.
+     */
     if(device_storage.magic_byte != NS_STORAGE_MAGIC)
     {
         memset(&device_storage, 0, NS_STORAGE_SIZE);
@@ -112,16 +134,17 @@ int main()
     ns_device_config_s config = {
         .colors = colors,
         .device_mac = {0},
-        .host_mac = {0}, // Host data is optional
-        .gyro_full_scale_dps = 2000, // DPS scale of your gyro sensor if used
-        .gyro_rad_per_lsb = 0, // This is set automatically when we init the library
+        .host_mac = {0}, /* Optional, but useful when reconnecting over Bluetooth. */
+        .gyro_full_scale_dps = 2000, /* Placeholder IMU full-scale range for future sensor wiring. */
+        .gyro_rad_per_lsb = 0, /* Computed by the library during init from gyro_full_scale_dps. */
         .transport = boot_mode.transport,
-        .type = NS_DEVTYPE_SNES_JP, // NS Device Type
+        .type = NS_DEVTYPE_SNES_JP, /* Example controller identity exposed to the host. */
     };
 
     memcpy(config.device_mac, device_mac, 6);
     memcpy(config.host_mac, device_storage.host_mac, 6);
 
+    /* Once the library accepts the config, the rest of the app is just transport-specific plumbing. */
     if(ns_lib_init(&config) == NS_CONFIG_OK)
     {
         if (boot_mode.transport == NS_TRANSPORT_BTC)
@@ -138,41 +161,46 @@ int main()
     }
 }
 
-// NS LIB CALLBACK FUNCTIONS
-// These need to be implemented by us, the developer
+/* -------------------------------------------------------------------------- */
+/* NS-LIB-HID callback implementations                                         */
+/* -------------------------------------------------------------------------- */
+
 void ns_set_led_cb(int player_leds)
 {
-    // 0 means LEDs are off here.
-    // Otherwise we can use this as 
-    // we see fit based on the player
-    // number assignment.
+    /*
+     * The host uses this to communicate player index state. The example leaves
+     * it empty because there is no LED hardware attached.
+     */
+    (void)player_leds;
 }
 
 void ns_set_power_cb(uint8_t shutdown)
 {
-    // In Bluetooth mode, this is called
-    // when the gamepad receives a 'shutdown' event
+    /*
+     * Bluetooth hosts may request that the controller power down. A product
+     * build could latch this into a PMIC or enter a low-power state here.
+     */
+    (void)shutdown;
 }
 
 void ns_set_usbpair_cb(ns_usbpair_s pairing_data)
 {
-    // When we connect the gamepad to the Nintendo Switch
-    // via USB connection, after a pairing communication,
-    // this function is called which provides the link key 
-    // as well as the host mac address for safekeeping
+    /*
+     * Pairing data is one of the few pieces of state that must survive resets.
+     * Saving it here allows the Bluetooth path to reconnect later without
+     * repeating the full pairing flow every boot.
+     */
 
-    // Copy data and save
     memcpy(device_storage.link_key, pairing_data.link_key, 16);
     memcpy(device_storage.host_mac, pairing_data.host_mac, 6);
 
-    // Save
+    /* Flash writes are queued and executed from the transport loops via ns_flash_task(). */
     ns_flash_write((uint8_t *) &device_storage, NS_STORAGE_SIZE, NS_STORAGE_PAGE);
 }
 
 void ns_set_imumode_cb(ns_imu_mode_t mode)
 {
-    // This is called when the gamepad
-    // receives a command to change IMU mode
+    /* The host can switch between no IMU, raw IMU, and quaternion-based reporting. */
     switch(mode)
     {
         case NS_IMU_OFF:
@@ -188,23 +216,19 @@ void ns_set_imumode_cb(ns_imu_mode_t mode)
 
 void ns_set_haptic_indices_cb(const ns_lib_haptic_raw_sample_s *pairs, uint8_t pair_count)
 {
-    // Each time that the gamepad receives a valid haptic packet,
-    // it is translated into a set of data pairs representing 
-    // LOOKUP VALUES for up to 3
-    // Hi frequency/Amplitude values, and Lo frequency/Amplitude values.
+    /*
+     * NS-LIB-HID decodes HD-rumble packets into lookup values. The example
+     * stops at that decoded representation because it has no actuator driver.
+     */
+    (void)pairs;
+    (void)pair_count;
 
-    float hi_f, lo_f, hi_a, lo_a;
-
-    // These can be combined together by generating two PCM streams
-    // utilizing the frequency/amplitude pairs. 
+    /* A real implementation would convert the decoded pairs into motor drive data. */
 }
 
 void ns_get_powerstatus_cb(ns_powerstatus_s *out)
 {
-    // This is tells the
-    // Nintendo Switch how our 
-    // gamepad is powered and
-    // the status of our device power
+    /* Report a simple always-on, externally-powered device to keep the example deterministic. */
     out->bat_lvl = 4;
     out->charging = 0;
     out->connection = 1;
@@ -213,17 +237,15 @@ void ns_get_powerstatus_cb(ns_powerstatus_s *out)
 
 void ns_get_inputdata_cb(ns_inputdata_s *out)
 {
-    // See ns_inputdata_s definition for full
-    // Abilities to set these params
-    // Ideally we should spend as little
-    // time in this function as possible
-    // or just fill it with input data 
-    // that we've already read!
+    /*
+     * Keep this path light: the library may call it frequently, so production
+     * firmware should ideally copy from already-sampled input state.
+     */
 
     out->a = !gpio_get(NS_A_BUTTON_PIN);
     out->b = !gpio_get(NS_B_BUTTON_PIN);
 
-    // Joystick values are 12 bit unsigned
+    /* Center both sticks. Switch stick channels are 12-bit unsigned values. */
     out->ls_x = 2048;
     out->ls_y = 2048;
 
@@ -231,25 +253,25 @@ void ns_get_inputdata_cb(ns_inputdata_s *out)
     out->rs_y = 2048;
 }
 
-// HAL time function
+/* Platform hook: supply a monotonic millisecond clock for report timers. */
 void ns_get_time_ms(uint64_t *ms)
 {
     *ms = time_us_64() / 1000;
 }
 
-// HAL random u8 function
+/* Platform hook: used by the library when it needs a random byte source. */
 uint8_t ns_get_random_u8(void)
 {
     return (uint8_t) (get_rand_32() & 0xFF);
 }
 
-// IMU SENSOR DATA
+/* IMU hooks are left blank in the example because no sensor is wired in. */
 void ns_get_imu_standard_cb(ns_gyrodata_s *out)
 {
-
+    (void)out;
 }
 
 void ns_get_imu_quaternion_cb(ns_quaternion_s *out)
 {
-
+    (void)out;
 }

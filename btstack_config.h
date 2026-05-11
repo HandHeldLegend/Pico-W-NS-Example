@@ -10,7 +10,7 @@
 #define ENABLE_PRINTF_HEXDUMP
 #define ENABLE_SCO_OVER_HCI
 
-// BTstack configuration. buffers, sizes, ...
+/* Fixed-size resource counts sized for one controller-class device on constrained hardware. */
 #define HCI_OUTGOING_PRE_BUFFER_SIZE 4
 #define HCI_ACL_PAYLOAD_SIZE 128
 
@@ -36,33 +36,31 @@
 #define MAX_NR_WHITELIST_ENTRIES 16
 #define MAX_NR_LE_DEVICE_DB_ENTRIES 16
 
-// Limit number of ACL/SCO Buffer to use by stack to avoid cyw43 shared bus
-// overrun
+/* Limit controller-side buffering so the CYW43 shared bus is not overrun under bursty traffic. */
 #define MAX_NR_CONTROLLER_ACL_BUFFERS 8
 #define MAX_NR_CONTROLLER_SCO_PACKETS 0
 
-// Enable and configure HCI Controller to Host Flow Control to avoid cyw43
-// shared bus overrun
+/* Flow control further reduces the chance of overrunning the Pico W radio transport. */
 #define ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL
 #define HCI_HOST_ACL_PACKET_LEN 1024
 #define HCI_HOST_ACL_PACKET_NUM 2
 #define HCI_HOST_SCO_PACKET_LEN 0
 #define HCI_HOST_SCO_PACKET_NUM 0
 
-// Link Key DB and LE Device DB using TLV on top of Flash Sector interface
+/* Allow BTstack to keep its own key database in flash alongside the example's app-owned sector. */
 #define NVM_NUM_DEVICE_DB_ENTRIES 16
 #define NVM_NUM_LINK_KEYS 16
 
-// We don't give btstack a malloc, so use a fixed-size ATT DB.
+/* Avoid heap allocation by using a fixed-size ATT database. */
 #define MAX_ATT_DB_SIZE 512
 
-// BTstack HAL configuration
+/* BTstack HAL integration points supplied by the Pico SDK and this example. */
 #define HAVE_EMBEDDED_TIME_MS
 
-// map btstack_assert onto Pico SDK assert()
+/* Map btstack_assert() onto the Pico SDK's assert implementation. */
 #define HAVE_ASSERT
 
-// Some USB dongles take longer to respond to HCI reset (e.g. BCM20702A).
+/* Give slower controllers longer to finish HCI reset before retrying. */
 #define HCI_RESET_RESEND_TIMEOUT_MS 1000
 
 #define ENABLE_SOFTWARE_AES128

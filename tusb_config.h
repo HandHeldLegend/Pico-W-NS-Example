@@ -34,18 +34,17 @@
 // COMMON CONFIGURATION
 //--------------------------------------------------------------------
 
-// defined by board.mk
+// Defined by the Pico/TinyUSB board support layer.
 #ifndef CFG_TUSB_MCU
   #error CFG_TUSB_MCU must be defined
 #endif
 
-// RHPort number used for device can be defined by board.mk, default to port 0
+// Use the default root hub port unless the board support package overrides it.
 #ifndef BOARD_DEVICE_RHPORT_NUM
   #define BOARD_DEVICE_RHPORT_NUM     0
 #endif
 
-// RHPort max operational speed can defined by board.mk
-// Default to Highspeed for MCU with internal HighSpeed PHY (can be port specific), otherwise FullSpeed
+// Default to HighSpeed only on MCUs that provide it natively; RP2040 remains FullSpeed.
 #ifndef BOARD_DEVICE_RHPORT_SPEED
   #if (CFG_TUSB_MCU == OPT_MCU_LPC18XX || CFG_TUSB_MCU == OPT_MCU_LPC43XX || CFG_TUSB_MCU == OPT_MCU_MIMXRT10XX || \
        CFG_TUSB_MCU == OPT_MCU_NUC505  || CFG_TUSB_MCU == OPT_MCU_CXD56 || CFG_TUSB_MCU == OPT_MCU_SAMX7X)
@@ -55,7 +54,7 @@
   #endif
 #endif
 
-// Device mode with rhport and speed defined by board.mk
+// Enable device mode on the configured root hub port.
 #if   BOARD_DEVICE_RHPORT_NUM == 0
   #define CFG_TUSB_RHPORT0_MODE     (OPT_MODE_DEVICE | BOARD_DEVICE_RHPORT_SPEED)
 #elif BOARD_DEVICE_RHPORT_NUM == 1
@@ -68,7 +67,7 @@
 #define CFG_TUSB_OS               OPT_OS_PICO
 #endif
 
-// CFG_TUSB_DEBUG is defined by compiler in DEBUG build
+// CFG_TUSB_DEBUG may be defined by the build system in debug builds.
 // #define CFG_TUSB_DEBUG           0
 
 /* USB DMA on some MCUs can only access a specific SRAM region with restriction on alignment.
@@ -94,7 +93,7 @@
 #define CFG_TUD_ENDPOINT0_SIZE    64
 #endif
 
-//------------- CLASS -------------//
+// Class counts kept broad because the upstream Pico TinyUSB examples expose multiple interfaces.
 #define CFG_TUD_HID               2
 #define CFG_TUD_CDC               2
 #define CFG_TUD_MSC               0
@@ -103,7 +102,7 @@
 #define CFG_TUD_GC                1
 #define CFG_TUD_XINPUT            1
 
-// HID buffer size Should be sufficient to hold ID (if any) + Data
+// 64-byte endpoints match the Switch-style report size used by this example.
 #define CFG_TUD_HID_EP_BUFSIZE    64
 #define CFG_TUD_VENDOR_EPSIZE     64
 #define CFG_TUD_VENDOR_RX_BUFSIZE 64

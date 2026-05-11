@@ -1,0 +1,45 @@
+Pico-W-NS-Example License
+
+Copyright (c) 2026 Hand Held Legend, LLC.
+Author: Mitchell Cairns
+
+Unless otherwise noted, the example application code and original documentation
+in this repository are licensed under the Creative Commons
+Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+
+You are free to:
+- Share — copy and redistribute the material in any medium or format
+- Adapt — remix, transform, and build upon the material
+
+Under the following terms:
+- Attribution — You must give appropriate credit, provide a link to the
+  license, and indicate if changes were made.
+- NonCommercial — You may not use the material for commercial purposes.
+- No additional restrictions — You may not apply legal terms or technological
+  measures that legally restrict others from doing anything the license permits.
+
+Full license:
+https://creativecommons.org/licenses/by-nc/4.0/
+
+Canonical legal code:
+https://creativecommons.org/licenses/by-nc/4.0/legalcode.en
+
+Scope and exclusions:
+- This license file applies to the Pico-W-NS-Example example project content
+  created for this repository, including the example source files and original
+  documentation, unless a file states otherwise.
+- The contents of `external/NS-LIB-HID` are not covered by this license file.
+  That library carries its own notices and licensing terms.
+- Third-party material and template-derived content included elsewhere in this
+  repository remain subject to their own original license notices where present.
+
+Attribution guidance:
+When redistributing or adapting the example content covered by this license,
+provide attribution to Mitchell Cairns and Hand Held Legend, LLC, include a link
+to the CC BY-NC 4.0 license, and indicate whether changes were made.
+
+Commercial licensing inquiries:
+support@handheldlegend.com
+
+No warranties are given. This summary is provided for repository clarity; the
+Creative Commons legal code linked above controls.

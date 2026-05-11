@@ -1,3 +1,19 @@
+/**
+ * @file ns_flash.c
+ * @brief Minimal flash-backed persistence used by the Pico W example.
+ *
+ * Author: Mitchell Cairns
+ * Copyright (c) 2026 Hand Held Legend, LLC.
+ *
+ * Licensed under the Creative Commons Attribution-NonCommercial 4.0 International
+ * License (CC BY-NC 4.0). Non-commercial use with attribution; commercial use
+ * requires permission from Hand Held Legend, LLC. Licensing inquiries:
+ * support@handheldlegend.com
+ * Full terms: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+ *
+ * SPDX-License-Identifier: CC-BY-NC-4.0
+ */
+
 #include "main.h"
 
 #include "pico/flash.h"
@@ -5,8 +21,14 @@
 #include "hardware/structs/xip_ctrl.h"
 
 #include "pico/btstack_flash_bank.h"
+
+/*
+ * Reserve one sector immediately ahead of BTstack's flash-bank storage so the
+ * example can persist its own pairing structure without colliding with BTstack.
+ */
 #define FLASH_START_OFFSET (PICO_FLASH_BANK_STORAGE_OFFSET - FLASH_SECTOR_SIZE)
 
+/* Flash writes are queued so callers can request persistence from callbacks without blocking there. */
 volatile bool _flash_go = false;
 uint8_t *_write_from = NULL;
 volatile uint32_t _write_size = 0;
@@ -14,20 +36,19 @@ volatile uint32_t _write_offset = 0;
 
 uint32_t _get_sector_offset_read(uint32_t page)
 {
-    // Calculate offset from the end of flash backwards
+    /* XIP reads use an absolute memory-mapped address. */
     uint32_t target_offset = XIP_BASE + FLASH_START_OFFSET - (page * FLASH_SECTOR_SIZE);
     return target_offset;
 }
 
 uint32_t _get_sector_offset_write(uint32_t page)
 {
-    // Calculate offset from the end of flash backwards
+    /* Erase/program operations use the raw flash offset instead of the XIP alias. */
     uint32_t target_offset = FLASH_START_OFFSET - (page * FLASH_SECTOR_SIZE);
     return target_offset;
 }
 
-// Write data to flash. Different pages can be used to switch between memory items
-// Memory being written must match the device sector size
+/* Queue a single-sector write request for later execution from ns_flash_task(). */
 bool ns_flash_write(uint8_t *data, uint32_t size, uint32_t page) 
 {
     if(_flash_go) return false;
@@ -43,13 +64,15 @@ bool ns_flash_write(uint8_t *data, uint32_t size, uint32_t page)
 
 void _flash_safe_write(void * params)
 {
-    // Create blank page data
+    (void)params;
+
+    /*
+     * The RP2040 can only program erased flash, so rebuild a full sector image
+     * in RAM, erase the target sector, then program the completed sector back.
+     */
     uint8_t thisPage[FLASH_SECTOR_SIZE] = {0x00};
-    // Copy settings into our page buffer
     memcpy(thisPage, _write_from, _write_size);
-    // Erase the settings flash sector
     flash_range_erase(_write_offset, FLASH_SECTOR_SIZE);
-    // Program the flash sector with our page
     flash_range_program(_write_offset, thisPage, FLASH_SECTOR_SIZE);
 }
 
@@ -63,7 +86,7 @@ bool ns_flash_read(uint8_t *out, uint32_t size, uint32_t page)
     return true;
 }
 
-// Should be called from both cores really
+/* Initialize Pico's flash-safe execution helpers before any queued writes run. */
 void ns_flash_init()
 {
     uint core = get_core_num();
@@ -73,8 +96,7 @@ void ns_flash_init()
     }
 }
 
-// Run this to apply our flash if
-// our flash flag is set
+/* Service pending writes from the main transport loops. */
 void ns_flash_task()
 {
     if(_flash_go)

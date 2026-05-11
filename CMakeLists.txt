@@ -1,4 +1,15 @@
-# Generated Cmake Pico project file
+# Pico-W-NS-Example build configuration
+#
+# Author: Mitchell Cairns
+# Copyright (c) 2026 Hand Held Legend, LLC.
+#
+# Licensed under the Creative Commons Attribution-NonCommercial 4.0 International
+# License (CC BY-NC 4.0). Non-commercial use with attribution; commercial use
+# requires permission from Hand Held Legend, LLC. Licensing inquiries:
+# support@handheldlegend.com
+# Full terms: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+#
+# SPDX-License-Identifier: CC-BY-NC-4.0
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -33,7 +44,7 @@ project(Pico-W-NS-Example C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# Add executable. Default name is the project name, version 0.1
+# Build the example firmware as a single executable with the two transport adapters.
 
 add_executable(Pico-W-NS-Example
     main.c 
@@ -52,19 +63,19 @@ target_compile_definitions(Pico-W-NS-Example PRIVATE
     PICO_DEFAULT_UART_RX_PIN=13
 )
 
-# Add the standard library to the build
+# Core Pico runtime support used by the example and its simple platform hooks.
 target_link_libraries(Pico-W-NS-Example
         pico_stdlib
         pico_rand
 )
 
-# Disable LWIP
+# The example only needs CYW43 for Bluetooth, not Wi-Fi networking.
 target_compile_definitions(Pico-W-NS-Example
   INTERFACE
   CYW43_LWIP=0
 )
 
-# Add the standard include files to the build
+# Local includes for the example sources.
 target_include_directories(Pico-W-NS-Example PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
@@ -72,18 +83,18 @@ target_include_directories(Pico-W-NS-Example PRIVATE
 # Import NS-LIB-HID library
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/external/NS-LIB-HID")
 
-# Add the NS-LIB-HID library
+# Link the protocol/descriptor library used by both USB and Bluetooth transports.
 target_link_libraries(Pico-W-NS-Example
     ns_lib_hid
 )
 
-# Add USB related libraries
+# TinyUSB powers the wired HID transport path.
 target_link_libraries(Pico-W-NS-Example 
     tinyusb_device
     tinyusb_board
 )
 
-# Add wireless networking libraries
+# Pico W Bluetooth stack pieces required for the Classic HID path.
 target_link_libraries(Pico-W-NS-Example 
     pico_cyw43_arch_none 
     pico_cyw43_driver 
@@ -96,6 +107,6 @@ target_link_libraries(Pico-W-NS-Example
 
 pico_add_extra_outputs(Pico-W-NS-Example)
 
-# Modify the below lines to enable/disable output over UART/USB
+# Route debug prints to UART so GP0/GP1 remain available as boot-mode straps.
 pico_enable_stdio_uart(Pico-W-NS-Example 1)
 pico_enable_stdio_usb(Pico-W-NS-Example 0)
