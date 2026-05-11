@@ -7,6 +7,17 @@
 #include "hardware/timer.h"
 #include "pico/rand.h"
 
+typedef struct
+{
+    uint32_t magic_byte;
+    uint8_t host_mac[6];
+    uint8_t link_key[16];
+} ns_storage_s;
+
+#define NS_STORAGE_MAGIC 0xDEADFEED
+#define NS_STORAGE_SIZE sizeof(ns_storage_s)
+#define NS_STORAGE_PAGE 0
+
 // Colors can accept RGB Hex values 
 const ns_colordata_s colors = {
     .body_r = 0xFF,
@@ -28,12 +39,27 @@ const ns_colordata_s colors = {
 
 // Example device mac address
 const uint8_t device_mac[6] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF2};
+static ns_storage_s device_storage = {0};
 
 int main()
 {
     stdio_init_all();
-    sleep_ms(1000);
+    sleep_ms(500);
     printf("Pico-W Booted.");
+
+    ns_flash_init();
+
+    // Load flash data storage
+    ns_flash_read((uint8_t*) &device_storage, NS_STORAGE_SIZE, NS_STORAGE_PAGE);
+
+    // If our magic 32 bit value does not match
+    // initialize the storage magic byte and clear
+    // the entire struct
+    if(device_storage.magic_byte != NS_STORAGE_MAGIC)
+    {
+        memset(&device_storage, 0, NS_STORAGE_SIZE);
+        device_storage.magic_byte = NS_STORAGE_MAGIC;
+    }
 
     ns_device_config_s config = {
         .colors = colors,
@@ -46,6 +72,7 @@ int main()
     };
 
     memcpy(config.device_mac, device_mac, 6);
+    memcpy(config.host_mac, device_storage.host_mac, 6);
 
     if(ns_lib_init(&config) == NS_CONFIG_OK)
     {
@@ -75,10 +102,13 @@ void ns_set_usbpair_cb(ns_usbpair_s pairing_data)
     // via USB connection, after a pairing communication,
     // this function is called which provides the link key 
     // as well as the host mac address for safekeeping
-    
-    // Accesss with:
-    // pairing_data.host_mac[6]
-    // pairing_data.link_key[16]
+
+    // Copy data and save
+    memcpy(device_storage.link_key, pairing_data.link_key, 16);
+    memcpy(device_storage.host_mac, pairing_data.host_mac, 6);
+
+    // Save
+    ns_flash_write((uint8_t *) &device_storage, NS_STORAGE_SIZE, NS_STORAGE_PAGE);
 }
 
 void ns_set_imumode_cb(ns_imu_mode_t mode)

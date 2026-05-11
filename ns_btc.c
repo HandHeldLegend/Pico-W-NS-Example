@@ -40,7 +40,7 @@ static void _ns_btc_outputreport_handler(uint16_t cid,
     if (cid != hid_cid) return;
     if (!report || report_size == 0) return;
 
-    memset(_ns_btc_output_report, 0, 64);
+    memset(_ns_btc_output_report_data, 0, 64);
 
     // 1. Set the Report ID as the first byte
     _ns_btc_output_report_data[0] = (uint8_t)report_id;

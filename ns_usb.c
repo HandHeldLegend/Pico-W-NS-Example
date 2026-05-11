@@ -25,6 +25,7 @@ void ns_usb_enter(void)
     for(;;)
     {
         tud_task();
+        ns_flash_task();
 
         if(!_usb_ready)
         {

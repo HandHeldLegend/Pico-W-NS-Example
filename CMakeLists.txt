@@ -39,6 +39,7 @@ add_executable(Pico-W-NS-Example
     main.c 
     ns_usb.c 
     ns_btc.c 
+    ns_flash.c 
 )
 
 pico_set_program_name(Pico-W-NS-Example "Pico-W-NS-Example")
