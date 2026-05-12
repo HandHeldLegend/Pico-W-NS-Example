@@ -234,7 +234,7 @@ static void _ns_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             ns_usbpair_s usbpair = {0};
             memcpy(usbpair.host_mac, addr, 6);
             memcpy(usbpair.link_key, link_key_be, 16);
-            ns_set_usbpair_cb(usbpair);
+            ns_api_hook_set_usbpair(usbpair);
         break;
 
         case HCI_EVENT_USER_CONFIRMATION_REQUEST:

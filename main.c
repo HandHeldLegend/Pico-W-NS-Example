@@ -37,21 +37,10 @@ typedef struct
 
 /* Example SPI color data reported by the library when the host queries controller identity. */
 const ns_colordata_s colors = {
-    .body_r = 0xFF,
-    .body_g = 0, 
-    .body_b = 0,
-
-    .buttons_r = 0,
-    .buttons_g = 0,
-    .buttons_b = 0,
-
-    .l_grip_r = 0,
-    .l_grip_g = 0,
-    .l_grip_b = 0,
-
-    .r_grip_r = 0,
-    .r_grip_g = 0,
-    .r_grip_b = 0,
+    .body.hex = 0xFF0000,       // Red
+    .buttons.hex = 0x00FF00,    // Green
+    .l_grip.hex = 0x0000FF,     // Blue
+    .r_grip.hex = 0xFFFFFF,     // White
 };
 
 /* Example controller address used for descriptor identity and Bluetooth bring-up. */
@@ -138,14 +127,14 @@ int main()
         .gyro_full_scale_dps = 2000, /* Placeholder IMU full-scale range for future sensor wiring. */
         .gyro_rad_per_lsb = 0, /* Computed by the library during init from gyro_full_scale_dps. */
         .transport = boot_mode.transport,
-        .type = NS_DEVTYPE_SNES_JP, /* Example controller identity exposed to the host. */
+        .type = NS_DEVTYPE_PROCON, /* Example controller identity exposed to the host. */
     };
 
     memcpy(config.device_mac, device_mac, 6);
     memcpy(config.host_mac, device_storage.host_mac, 6);
 
     /* Once the library accepts the config, the rest of the app is just transport-specific plumbing. */
-    if(ns_lib_init(&config) == NS_CONFIG_OK)
+    if(ns_api_init(&config) == NS_CONFIG_OK)
     {
         if (boot_mode.transport == NS_TRANSPORT_BTC)
         {
@@ -165,7 +154,33 @@ int main()
 /* NS-LIB-HID callback implementations                                         */
 /* -------------------------------------------------------------------------- */
 
-void ns_set_led_cb(int player_leds)
+/* Platform hook: supply a monotonic millisecond clock for report timers. */
+void ns_api_hook_get_time_ms(uint64_t *ms)
+{
+    *ms = time_us_64() / 1000;
+}
+
+/* Platform hook: used by the library when it needs a random byte source. */
+uint8_t ns_api_hook_get_random_u8(void)
+{
+    return (uint8_t) (get_rand_32() & 0xFF);
+}
+
+void ns_api_hook_set_haptic_packet_raw(ns_haptics_packet_raw_s *packet)
+{
+    /*
+     * NS-LIB-HID decodes HD-rumble packets into lookup values. The example
+     * stops at that decoded representation because it has no actuator driver.
+     */
+    (void)&packet;
+
+    /* 
+    *  A real implementation would convert the decoded pairs into motor drive data. 
+    *  ns_api_convert_haptic_packet( ns_haptics_packet_raw_s *in, ns_haptics_packet_processed_s *out )
+    */
+}
+
+void ns_api_hook_set_led(int player_leds)
 {
     /*
      * The host uses this to communicate player index state. The example leaves
@@ -174,7 +189,7 @@ void ns_set_led_cb(int player_leds)
     (void)player_leds;
 }
 
-void ns_set_power_cb(uint8_t shutdown)
+void ns_api_hook_set_power(uint8_t shutdown)
 {
     /*
      * Bluetooth hosts may request that the controller power down. A product
@@ -183,7 +198,7 @@ void ns_set_power_cb(uint8_t shutdown)
     (void)shutdown;
 }
 
-void ns_set_usbpair_cb(ns_usbpair_s pairing_data)
+void ns_api_hook_set_usbpair(ns_usbpair_s pairing_data)
 {
     /*
      * Pairing data is one of the few pieces of state that must survive resets.
@@ -198,10 +213,19 @@ void ns_set_usbpair_cb(ns_usbpair_s pairing_data)
     ns_flash_write((uint8_t *) &device_storage, NS_STORAGE_SIZE, NS_STORAGE_PAGE);
 }
 
-void ns_set_imumode_cb(ns_imu_mode_t mode)
+void ns_api_hook_get_powerstatus(ns_powerstatus_s *out)
+{
+    /* Report a simple always-on, externally-powered device to keep the example deterministic. */
+    out->bat_lvl = 4;
+    out->charging = 0;
+    out->connection = 1;
+    out->power_source = 1;
+}
+
+void ns_api_hook_set_imu_mode(ns_imu_mode_t imu_mode)
 {
     /* The host can switch between no IMU, raw IMU, and quaternion-based reporting. */
-    switch(mode)
+    switch(imu_mode)
     {
         case NS_IMU_OFF:
         break;
@@ -214,28 +238,27 @@ void ns_set_imumode_cb(ns_imu_mode_t mode)
     }
 }
 
-void ns_set_haptic_indices_cb(const ns_lib_haptic_raw_sample_s *pairs, uint8_t pair_count)
+/* IMU hooks are left blank in the example because no sensor is wired in. */
+void ns_api_hook_get_imu(ns_gyrodata_s *out)
+{
+    (void)&out;
+}
+
+void ns_api_hook_get_quaternion(ns_quaternion_s *out)
 {
     /*
-     * NS-LIB-HID decodes HD-rumble packets into lookup values. The example
-     * stops at that decoded representation because it has no actuator driver.
-     */
-    (void)pairs;
-    (void)pair_count;
+    * In Quatnernion IMU mode, the app is responsible for calling
+    * ns_api_motion_update_quaternion( ) as often as you poll your IMU
+    * data source. 
+    * 
+    * Within this hook, you should provide the most recent state 
+    * So the API can send the updated data to the host.
+    */
 
-    /* A real implementation would convert the decoded pairs into motor drive data. */
+    (void)&out;
 }
 
-void ns_get_powerstatus_cb(ns_powerstatus_s *out)
-{
-    /* Report a simple always-on, externally-powered device to keep the example deterministic. */
-    out->bat_lvl = 4;
-    out->charging = 0;
-    out->connection = 1;
-    out->power_source = 1;
-}
-
-void ns_get_inputdata_cb(ns_inputdata_s *out)
+void ns_api_hook_get_input(ns_input_s *out)
 {
     /*
      * Keep this path light: the library may call it frequently, so production
@@ -251,27 +274,4 @@ void ns_get_inputdata_cb(ns_inputdata_s *out)
 
     out->rs_x = 2048;
     out->rs_y = 2048;
-}
-
-/* Platform hook: supply a monotonic millisecond clock for report timers. */
-void ns_get_time_ms(uint64_t *ms)
-{
-    *ms = time_us_64() / 1000;
-}
-
-/* Platform hook: used by the library when it needs a random byte source. */
-uint8_t ns_get_random_u8(void)
-{
-    return (uint8_t) (get_rand_32() & 0xFF);
-}
-
-/* IMU hooks are left blank in the example because no sensor is wired in. */
-void ns_get_imu_standard_cb(ns_gyrodata_s *out)
-{
-    (void)out;
-}
-
-void ns_get_imu_quaternion_cb(ns_quaternion_s *out)
-{
-    (void)out;
 }
