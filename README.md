@@ -1,6 +1,6 @@
 # Pico-W-NS-Example
 
-`v0.1.0`
+`v0.2.0`
 
 This repository is a Raspberry Pi Pico W example that uses
 [`NS-LIB-HID`](https://github.com/HandHeldLegend/NS-LIB-HID) to present
@@ -32,10 +32,12 @@ following:
   - `B` on `GP15`
 - Keeps both analog sticks centered.
 - Leaves IMU reporting unimplemented.
-- Leaves player LEDs, shutdown handling, and haptics as stubs.
+- Leaves player LEDs and shutdown handling as stubs.
+- Decodes host haptics into raw lookup-index packets, but does not drive a real
+  actuator.
 - Stores host MAC + link key when pairing data becomes available.
 - Uses a fixed example device MAC address in `main.c`.
-- Configures the library with `NS_DEVTYPE_SNES_JP` in `main.c`.
+- Configures the library with `NS_DEVTYPE_PROCON` in `main.c`.
 
 That makes the project a good transport and protocol example, but not yet a
 full-featured controller implementation.
@@ -117,7 +119,7 @@ through `ns_flash_task()` instead of writing immediately from a callback. That
 design matters because flash erase/program operations are sensitive on RP2040
 systems and are safer when funneled through one controlled path.
 
-`ns_set_usbpair_cb()` is the application hook that copies the pairing data into
+`ns_api_hook_set_usbpair()` is the application hook that copies the pairing data into
 `device_storage` and schedules the write. In this example that callback is used
 as the central place to preserve credentials, regardless of whether they were
 learned from USB-assisted pairing or the Bluetooth stack.
@@ -134,24 +136,36 @@ It:
 - initializes stdio and flash support
 - loads previously saved pairing data
 - fills `ns_device_config_s`
-- calls `ns_lib_init()`
+- calls `ns_api_init()`
 - hands execution to either `ns_usb_enter()` or `ns_btc_enter()`
 
 It also implements the callback surface that `NS-LIB-HID` expects platform
 firmware to own, such as:
 
-- `ns_get_inputdata_cb()`
-- `ns_get_powerstatus_cb()`
-- `ns_set_usbpair_cb()`
-- `ns_set_led_cb()`
-- `ns_set_imumode_cb()`
-- `ns_set_haptic_indices_cb()`
-- `ns_get_time_ms()`
-- `ns_get_random_u8()`
+- `ns_api_hook_get_input()`
+- `ns_api_hook_get_powerstatus()`
+- `ns_api_hook_set_usbpair()`
+- `ns_api_hook_set_led()`
+- `ns_api_hook_set_power()`
+- `ns_api_hook_set_imu_mode()`
+- `ns_api_hook_get_imu()`
+- `ns_api_hook_get_quaternion()`
+- `ns_api_hook_set_haptic_packet_raw()`
+- `ns_api_hook_get_time_ms()`
+- `ns_api_hook_get_random_u8()`
 
 That division of responsibility is deliberate: `NS-LIB-HID` handles the Switch
 protocol and descriptor content, while the application remains responsible for
 real hardware state, timing, persistence, and side effects.
+
+For input specifically, `ns_api_hook_get_input()` supplies logical button bits
+and unpacked stick values in `ns_input_s`; the library packs those values into
+the Switch report layout internally.
+
+For haptics, `ns_api_hook_set_haptic_packet_raw()` receives decoded lookup-table
+indices. The example stops there, but a real product could either consume those
+indices directly with precomputed fixed-point tables or call
+`ns_api_convert_haptic_packet()` to obtain float reference values.
 
 ### `ns_usb.c`
 
@@ -319,11 +333,12 @@ If you use this example as a base, these are the first things you will normally
 replace:
 
 - `device_mac` in `main.c` with a unique per-device address policy
-- the placeholder button/stick mapping in `ns_get_inputdata_cb()`
-- `ns_get_powerstatus_cb()` with real battery and charge reporting
-- `ns_set_led_cb()` with actual LED behavior
-- `ns_set_haptic_indices_cb()` with motor/actuator handling
-- `ns_get_imu_standard_cb()` / `ns_get_imu_quaternion_cb()` with sensor data
+- the placeholder button/stick mapping in `ns_api_hook_get_input()`
+- `ns_api_hook_get_powerstatus()` with real battery and charge reporting
+- `ns_api_hook_set_led()` with actual LED behavior
+- `ns_api_hook_set_power()` with product-specific power management behavior
+- `ns_api_hook_set_haptic_packet_raw()` with motor/actuator handling
+- `ns_api_hook_get_imu()` / `ns_api_hook_get_quaternion()` with sensor data
 - the selected `NS_DEVTYPE_*` identity in `main.c`
 
 ## Licensing
@@ -360,7 +375,7 @@ scope.
 
 ## Notes For Reviewers
 
-For release `v0.1.0`, the value of this repository is mainly educational:
+For release `v0.2.0`, the value of this repository is mainly educational:
 
 - it shows the smallest complete path from `NS-LIB-HID` init to live transport
 - it demonstrates where pairing data is captured and why it must be persisted
