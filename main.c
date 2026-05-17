@@ -16,6 +16,7 @@
 
 #include "main.h"
 
+#include "ns_ble_wake.h"
 #include "ns_lib.h"
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
@@ -25,6 +26,7 @@
 
 static const uint NS_BT_BOOT_PIN = 0;
 static const uint NS_BT_PAIR_BOOT_PIN = 1;
+static const uint NS_BT_CAPTURE_BOOT_PIN = 2;
 static const uint NS_A_BUTTON_PIN = 14;
 static const uint NS_B_BUTTON_PIN = 15;
 
@@ -33,6 +35,7 @@ typedef struct
 {
     ns_transport_t transport;
     bool pairing_mode;
+    bool capture_mode;
 } ns_boot_mode_s;
 
 /* Example SPI color data reported by the library when the host queries controller identity. */
@@ -62,9 +65,14 @@ static ns_boot_mode_s ns_get_boot_mode(void)
     ns_boot_mode_s boot_mode = {
         .transport = NS_TRANSPORT_USB,
         .pairing_mode = false,
+        .capture_mode = false,
     };
 
-    /* GP0/GP1 act as mode straps. The button inputs also use pull-ups, so all inputs are active-low. */
+    /* GP0/GP1/GP2 act as mode straps. Button inputs use pull-ups, so all inputs are active-low. */
+    gpio_init(NS_BT_CAPTURE_BOOT_PIN);
+    gpio_set_dir(NS_BT_CAPTURE_BOOT_PIN, GPIO_IN);
+    gpio_pull_up(NS_BT_CAPTURE_BOOT_PIN);
+
     gpio_init(NS_BT_BOOT_PIN);
     gpio_set_dir(NS_BT_BOOT_PIN, GPIO_IN);
     gpio_pull_up(NS_BT_BOOT_PIN);
@@ -81,7 +89,11 @@ static ns_boot_mode_s ns_get_boot_mode(void)
     gpio_set_dir(NS_B_BUTTON_PIN, GPIO_IN);
     gpio_pull_up(NS_B_BUTTON_PIN);
 
-    if (!gpio_get(NS_BT_PAIR_BOOT_PIN))
+    if (!gpio_get(NS_BT_CAPTURE_BOOT_PIN))
+    {
+        boot_mode.capture_mode = true;
+    }
+    else if (!gpio_get(NS_BT_PAIR_BOOT_PIN))
     {
         /* Pairing mode implies Bluetooth transport. */
         boot_mode.transport = NS_TRANSPORT_BTC;
@@ -117,8 +129,19 @@ int main()
         memset(&device_storage, 0, NS_STORAGE_SIZE);
         device_storage.magic_byte = NS_STORAGE_MAGIC;
     }
+    else if (device_storage.wake_magic != NS_WAKE_MAGIC)
+    {
+        device_storage.wake_valid = 0;
+    }
 
     ns_print_debug(device_storage.host_mac, device_storage.link_key);
+
+    if (boot_mode.capture_mode)
+    {
+        printf("Entering BLE wake capture mode\n");
+        ns_ble_capture_enter();
+        return 0;
+    }
 
     ns_device_config_s config = {
         .colors = colors,

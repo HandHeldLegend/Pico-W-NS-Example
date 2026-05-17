@@ -50,6 +50,7 @@ add_executable(Pico-W-NS-Example
     main.c 
     ns_usb.c 
     ns_btc.c 
+    ns_ble_wake.c
     ns_flash.c 
 )
 

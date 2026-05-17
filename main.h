@@ -30,6 +30,13 @@ typedef struct
     uint8_t host_mac[6];
     /* Stored in big-endian display order to match the example's debug output and flash dumps. */
     uint8_t link_key[16];
+    /* Minimal Switch 2 wake data (advertising params are fixed in firmware). */
+    uint32_t wake_magic;
+    uint8_t wake_valid;
+    uint8_t wake_addr_type;
+    uint8_t gamepad_addr[6];
+    uint16_t wake_product_id;
+    uint8_t wake_console_mac[6];
 } ns_storage_s;
 
 /* Simple single-page settings block used by the example's flash helper. */
@@ -50,5 +57,4 @@ void ns_flash_init();
 /* Transport entry points selected at boot. */
 void ns_usb_enter(void);
 void ns_btc_enter(uint8_t device_mac[6], bool pairing_mode);
-
 #endif

@@ -15,6 +15,7 @@
  */
 
 #include "main.h"
+#include "ns_ble_wake.h"
 
 #include "pico/cyw43_arch.h"
 #include "pico/btstack_chipset_cyw43.h"
@@ -31,6 +32,10 @@ static uint32_t _btc_last_hid_report_timestamp_ms = 0;
 static const char hid_device_name[] = "Wireless Gamepad";
 static const char hid_gap_name[] = "Pro Controller";
 static bool hid_device_pair_enabled = false;
+static bool _btc_wake_replay_pending = false;
+static bool _btc_hid_stack_ready = false;
+static volatile bool _btc_hci_ready = false;
+static volatile bool _btc_session_started = false;
 static btstack_timer_source_t hid_timer;
 
 /* Used to defer CYW43 teardown out of the event callback path. */
@@ -131,6 +136,63 @@ static void _ns_btc_outputreport_handler(uint16_t cid,
     ns_api_output_tunnel(_ns_btc_output_report, report_size + 1);
 }
 
+/* Runs from the main loop once HCI is up (never from the HCI event callback). */
+static void _ns_btc_start_session(void)
+{
+    if (hid_cid) return;
+
+    if (hid_device_pair_enabled)
+    {
+        gap_discoverable_control(1);
+        return;
+    }
+
+    if (device_storage.magic_byte == NS_STORAGE_MAGIC)
+    {
+        link_key_type_t read_type;
+        link_key_t read_key;
+
+        bool overwrite_key = false;
+
+        if (gap_get_link_key_for_bd_addr(device_storage.host_mac, read_key, &read_type))
+        {
+            printf("BTStack Stored Link Key:\n");
+            link_key_t read_key_be;
+            _btc_reverse_bytes(read_key, read_key_be, 16);
+            _ns_btstack_debug_print(device_storage.host_mac, read_type, read_key_be);
+
+            if (!_ns_btc_array_equal(read_key_be, device_storage.link_key, 16))
+            {
+                printf("\nBTStack Link Key mismatches local stored key!\n");
+                overwrite_key = true;
+            }
+        }
+        else
+        {
+            printf("BTStack Link Key for BD ADDR not found!\n");
+            overwrite_key = true;
+        }
+
+        if (overwrite_key)
+        {
+            printf("\nBTStack Will Now SAVE this Link Key:\n");
+            _ns_btstack_debug_print(device_storage.host_mac,
+                                    UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P192,
+                                    device_storage.link_key);
+            link_key_t link_key_le;
+            _btc_reverse_bytes(device_storage.link_key, link_key_le, 16);
+
+            gap_store_link_key_for_bd_addr(device_storage.host_mac, link_key_le,
+                                          UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P192);
+        }
+
+        hid_device_connect(device_storage.host_mac, &hid_cid);
+    }
+    else
+    {
+        gap_discoverable_control(1);
+    }
+}
 
 static void _ns_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t packet_size)
 {
@@ -142,75 +204,9 @@ static void _ns_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
         switch (packet[0])
         {
         case BTSTACK_EVENT_STATE:
-            if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING)
-                return;
-
-            if (!hid_cid)
+            if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING)
             {
-                /*
-                 * Pairing mode deliberately stays discoverable. Reconnect mode instead
-                 * tries to restore the last known host relationship automatically.
-                 */
-                if (hid_device_pair_enabled)
-                {
-                    gap_discoverable_control(1);
-                }
-                else
-                {
-                    /*
-                     * BTstack keeps link keys in its own store. The example mirrors
-                     * the last successful key in app flash so it can repopulate that
-                     * store after a cold boot before requesting a reconnect.
-                     */
-                    if(device_storage.magic_byte == NS_STORAGE_MAGIC)
-                    {
-                        link_key_type_t read_type;
-                        link_key_t read_key;
-                        
-                        bool overwrite_key = false;
-
-                        if(gap_get_link_key_for_bd_addr(device_storage.host_mac, read_key, &read_type))
-                        {
-                            printf("BTStack Stored Link Key:\n");
-                            link_key_t read_key_be;
-                            _btc_reverse_bytes(read_key, read_key_be, 16);
-                            _ns_btstack_debug_print(device_storage.host_mac, read_type, read_key_be);
-
-                            /* The example stores keys in big-endian display order, BTstack returns legacy LE order. */
-                            if(!_ns_btc_array_equal(read_key_be, device_storage.link_key, 16))
-                            {
-                                printf("\nBTStack Link Key mismatches local stored key!\n");
-                                overwrite_key = true;
-                            }
-                        }
-                        else
-                        {
-                            printf("BTStack Link Key for BD ADDR not found!\n");
-                            overwrite_key = true;
-                        }
-                        
-                        if(overwrite_key)
-                        {
-                            printf("\nBTStack Will Now SAVE this Link Key:\n");
-                            _ns_btstack_debug_print(device_storage.host_mac, 
-                                UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P192, 
-                                device_storage.link_key);
-                            link_key_t link_key_le;
-                            _btc_reverse_bytes(device_storage.link_key, link_key_le, 16);
-
-                            /* Repopulate BTstack's database so the reconnect attempt can proceed immediately. */
-                            gap_store_link_key_for_bd_addr(device_storage.host_mac, 
-                                link_key_le, UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P192);
-                        }
-
-                        hid_device_connect(device_storage.host_mac, &hid_cid);
-                    }
-                    else
-                    {
-                        /* No credentials exist yet, so fall back to discoverable mode. */
-                        gap_discoverable_control(1);
-                    }
-                }
+                _btc_hci_ready = true;
             }
             break;
 
@@ -258,11 +254,11 @@ static void _ns_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
 
                 hid_cid = hid_subevent_connection_opened_get_hid_cid(packet);
                 bd_addr_t addr;
-                uint8_t link_key[16] = {0};
 
                 hid_subevent_connection_opened_get_bd_addr(packet, addr);
 
                 printf("HID Connected to: %s\n", bd_addr_to_str(addr));
+                _btc_last_hid_report_timestamp_ms = 0;
                 hid_device_request_can_send_now_event(hid_cid);
 
                 break;
@@ -279,15 +275,12 @@ static void _ns_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                     uint8_t _ns_btc_report_data[64] = {0};
 
                     if (time_elapsed >= _btc_poll_rate_ms)
-                    {   
-                        /* Generate the next controller report only when the poll interval has elapsed. */
-                        if(ns_api_generate_inputreport(_ns_btc_report_data))
+                    {
+                        _btc_last_hid_report_timestamp_ms = current_time_ms;
+                        if (ns_api_generate_inputreport(_ns_btc_report_data))
                         {
                             _ns_btc_hid_tunnel(_ns_btc_report_data, 64);
                         }
-                        else break;
-
-                        _btc_last_hid_report_timestamp_ms = current_time_ms;
                         hid_device_request_can_send_now_event(hid_cid);
                     }
                     else
@@ -319,12 +312,55 @@ static void _ns_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
     }
 }
 
+static void _ns_btc_init_hid_stack(void)
+{
+    if (_btc_hid_stack_ready) return;
+
+    sdp_init();
+
+    const uint8_t *ns_hid_descriptor = NULL;
+    uint16_t ns_hid_descriptor_len = 0;
+    uint16_t ns_hid_vid = 0;
+    uint16_t ns_hid_pid = 0;
+
+    ns_hid_get_descriptor_params(&ns_hid_descriptor, &ns_hid_descriptor_len, NULL, NULL, &ns_hid_vid, &ns_hid_pid);
+
+    hid_sdp_record_t hid_sdp_record = {
+        .hid_device_subclass = NS_BTC_COD,
+        .hid_country_code = 33,
+        .hid_virtual_cable = 1,
+        .hid_remote_wake = 1,
+        .hid_reconnect_initiate = 1,
+        .hid_normally_connectable = 0,
+        .hid_boot_device = 0,
+        .hid_ssr_host_max_latency = 0xFFFF,
+        .hid_ssr_host_min_timeout = 0xFFFF,
+        .hid_supervision_timeout = 3200,
+        .hid_descriptor = ns_hid_descriptor,
+        .hid_descriptor_size = ns_hid_descriptor_len,
+        .device_name = hid_gap_name};
+
+    memset(hid_service_buffer, 0, sizeof(hid_service_buffer));
+    hid_create_sdp_record(hid_service_buffer, sdp_create_service_record_handle(), &hid_sdp_record);
+    sdp_register_service(hid_service_buffer);
+
+    memset(pnp_service_buffer, 0, sizeof(pnp_service_buffer));
+    device_id_create_sdp_record(pnp_service_buffer, sdp_create_service_record_handle(), DEVICE_ID_VENDOR_ID_SOURCE_USB,
+                                ns_hid_vid, ns_hid_pid, 0x0100);
+    sdp_register_service(pnp_service_buffer);
+
+    hid_device_init(0, ns_hid_descriptor_len, ns_hid_descriptor);
+    hid_device_accept_truncated_hid_reports(true);
+    hid_device_register_packet_handler(&_ns_btc_packet_handler);
+    hid_device_register_report_data_callback(&_ns_btc_outputreport_handler);
+
+    _btc_hid_stack_ready = true;
+}
+
 void ns_btc_enter(uint8_t device_mac[6], bool pairing_mode)
 {
-    /* Bring up the Pico W wireless stack before any BTstack objects are configured. */
     cyw43_arch_init();
 
-    /* GAP identity and policy configuration. */
     gap_set_bondable_mode(1);
     gap_set_class_of_device(NS_BTC_COD);
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
@@ -336,64 +372,56 @@ void ns_btc_enter(uint8_t device_mac[6], bool pairing_mode)
     l2cap_init();
     sm_init();
 
-    sdp_init();
-
-    const uint8_t* ns_hid_descriptor = NULL;
-    uint16_t ns_hid_descriptor_len = 0;
-    uint16_t ns_hid_vid = 0;
-    uint16_t ns_hid_pid = 0;
-
-    ns_hid_get_descriptor_params(&ns_hid_descriptor, &ns_hid_descriptor_len, NULL, NULL, &ns_hid_vid, &ns_hid_pid);
-
-    /* Publish the HID descriptor the host expects for this configured NS-LIB-HID transport. */
-    hid_sdp_record_t hid_sdp_record = {
-        .hid_device_subclass = NS_BTC_COD,  // Device Subclass HID
-        .hid_country_code = 33,             // Country Code
-        .hid_virtual_cable = 1,             // HID Virtual Cable
-        .hid_remote_wake = 1,               // HID Remote Wake
-        .hid_reconnect_initiate = 1,        // HID Reconnect Initiate
-        .hid_normally_connectable = 0,      // HID Normally Connectable
-        .hid_boot_device = 0,               // HID Boot Device
-        .hid_ssr_host_max_latency = 0xFFFF, // = x * 0.625ms
-        .hid_ssr_host_min_timeout = 0xFFFF,
-        .hid_supervision_timeout = 3200,                 // HID Supervision Timeout
-        .hid_descriptor         = ns_hid_descriptor,     // HID Descriptor
-        .hid_descriptor_size    = ns_hid_descriptor_len, // HID Descriptor Length
-        .device_name = hid_gap_name};                    // Device Name
-
-    /* HID service is mandatory so the console can discover report descriptors and HID capabilities. */
-    memset(hid_service_buffer, 0, sizeof(hid_service_buffer));
-    hid_create_sdp_record(hid_service_buffer, sdp_create_service_record_handle(), &hid_sdp_record);
-    sdp_register_service(hid_service_buffer);
-
-    /* Device ID / PnP service improves compatibility with newer hosts that expect it during discovery. */
-    memset(pnp_service_buffer, 0, sizeof(pnp_service_buffer));
-    device_id_create_sdp_record(pnp_service_buffer, sdp_create_service_record_handle(), DEVICE_ID_VENDOR_ID_SOURCE_USB,
-                                ns_hid_vid, ns_hid_pid, 0x0100);
-    sdp_register_service(pnp_service_buffer);
-
-    hid_device_init(0, ns_hid_descriptor_len, ns_hid_descriptor);
-
-    /* Accept shortened reports so hosts that trim trailing zeros still interoperate. */
-    hid_device_accept_truncated_hid_reports(true);
-
-    /* Funnel both raw HCI events and HID meta-events through the same state machine. */
     hci_event_callback_registration.callback = &_ns_btc_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
-    hid_device_register_packet_handler(&_ns_btc_packet_handler);
-
-    hid_device_register_report_data_callback(&_ns_btc_outputreport_handler);
 
     hid_device_pair_enabled = pairing_mode;
+    _btc_wake_replay_pending = !pairing_mode && ns_ble_wake_stored_valid(&device_storage);
+    _btc_hid_stack_ready = false;
+    _btc_hci_ready = false;
+    _btc_session_started = false;
 
-    /* Use the example's configured address before making the controller visible to other devices. */
     hci_power_control(HCI_POWER_ON);
-    hci_set_bd_addr(device_mac);
 
-    /* Main Bluetooth loop stays tiny: flash writes and any deferred teardown happen here. */
-    for(;;)
+    if (_btc_wake_replay_pending)
     {
+        hci_set_bd_addr(device_storage.gamepad_addr);
+    }
+    else
+    {
+        hci_set_bd_addr(device_mac);
+    }
+
+    if (!_btc_wake_replay_pending)
+    {
+        _ns_btc_init_hid_stack();
+    }
+
+    for (;;)
+    {
+        cyw43_arch_poll();
         ns_flash_task();
+
+        if (_btc_hci_ready && !_btc_session_started)
+        {
+            _btc_session_started = true;
+
+            if (_btc_wake_replay_pending)
+            {
+                ns_ble_wake_replay(&device_storage);
+                _btc_hci_ready = false;
+                ns_ble_wake_restore_controller_hci(device_mac);
+                while (!_btc_hci_ready)
+                {
+                    ns_flash_task();
+                    cyw43_arch_poll();
+                    sleep_us(1000);
+                }
+                _ns_btc_init_hid_stack();
+            }
+
+            _ns_btc_start_session();
+        }
 
         if(_btc_deinit_flag)
         {
