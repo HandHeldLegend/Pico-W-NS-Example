@@ -1,3 +1,6 @@
 [submodule "external/NS-LIB-HID"]
 	path = external/NS-LIB-HID
 	url = https://github.com/HandHeldLegend/NS-LIB-HID
+[submodule "external/HOJA-LIB-DONGLE"]
+	path = external/HOJA-LIB-DONGLE
+	url = https://github.com/HandHeldLegend/HOJA-LIB-DONGLE
