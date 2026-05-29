@@ -150,7 +150,7 @@ int main()
         .gyro_full_scale_dps = 2000, /* Placeholder IMU full-scale range for future sensor wiring. */
         .gyro_rad_per_lsb = 0, /* Computed by the library during init from gyro_full_scale_dps. */
         .transport = boot_mode.transport,
-        .type = NS_DEVTYPE_PROCON, /* Example controller identity exposed to the host. */
+        .type = NS_DEVTYPE_SNES_NA /* Example controller identity exposed to the host. */
     };
 
     memcpy(config.device_mac, device_mac, 6);

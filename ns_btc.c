@@ -364,7 +364,7 @@ void ns_btc_enter(uint8_t device_mac[6], bool pairing_mode)
     gap_set_bondable_mode(1);
     gap_set_class_of_device(NS_BTC_COD);
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
-    gap_set_local_name("Pro Controller");
+    gap_set_local_name(hid_gap_name);
     gap_set_allow_role_switch(true);
 
     hci_set_chipset(btstack_chipset_cyw43_instance());
