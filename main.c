@@ -240,10 +240,9 @@ void ns_api_hook_set_usbpair(ns_usbpair_s pairing_data)
 void ns_api_hook_get_powerstatus(ns_powerstatus_s *out)
 {
     /* Report a simple always-on, externally-powered device to keep the example deterministic. */
-    out->bat_lvl = 4;
-    out->charging = 0;
-    out->connection = 1;
-    out->power_source = 1;
+    out->battery_level = NS_BATLVL_FULL;
+    out->charging_status = NS_CHARGING_IDLE;
+    out->power_source = NS_POWERSRC_EXTERNAL;
 }
 
 void ns_api_hook_set_imu_mode(ns_imu_mode_t imu_mode)

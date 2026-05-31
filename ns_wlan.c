@@ -48,6 +48,7 @@
 
 #include "pico/cyw43_arch.h"
 #include "pico/rand.h"
+#include "pico/time.h"
 
 #include "lwip/udp.h"
 #include "lwip/ip4_addr.h"
@@ -167,6 +168,21 @@ static volatile uint32_t _wlan_rx_tail = 0;     /* written only by the main loop
 static volatile uint32_t _wlan_rx_dropped = 0;  /* datagrams discarded because the queue was full. */
 
 /* -------------------------------------------------------------------------- */
+/* Throughput stats.                                                          */
+/*                                                                            */
+/* The dongle polls at the report rate, so logging per packet floods the      */
+/* terminal. Instead we count the unreliable input reports we emit and print  */
+/* a single summary line once per second from the main loop. These counters   */
+/* are only touched on the main-loop context (the RX drain and the stats      */
+/* print both run there), so no synchronization is needed.                    */
+/* -------------------------------------------------------------------------- */
+#define NS_WLAN_STATS_PERIOD_MS 1000
+
+static uint32_t _wlan_stat_input_reports = 0;   /* unreliable reports sent this interval. */
+static uint32_t _wlan_stat_last_ms       = 0;   /* timestamp of the last stats print.      */
+static uint32_t _wlan_stat_last_dropped  = 0;   /* _wlan_rx_dropped at the last print.     */
+
+/* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -259,10 +275,14 @@ static void _ns_wlan_build_input_reply(dongle_pkt_s *tx)
     if (ns_api_generate_inputreport(report))
     {
         tx->id = (report[0] == 0x30) ? DONGLE_PID_CORE_UNRELIABLE : DONGLE_PID_CORE_RELIABLE;
-        if(tx->id==DONGLE_PID_CONFIG_RELIABLE)
+
+        /* Count the steady-state unreliable input reports so the main loop can
+         * print a clean per-second input rate (see _ns_wlan_report_stats). */
+        if (tx->id == DONGLE_PID_CORE_UNRELIABLE)
         {
-            printf("SENT RELIABLE");
+            _wlan_stat_input_reports++;
         }
+
         /* In Switch mode the whole 64-byte report (report id at byte 0) is the
          * CORE_UNRELIABLE payload the dongle relays to the console. */
         tx->len = 64;
@@ -298,13 +318,11 @@ static void _ns_wlan_apply_status(const dongle_status_u *status)
 
     /*
      * No physical actuator is wired into this example, so the rumble/brake
-     * amplitudes are only logged. A real product would drive its motors here,
-     * and its player LEDs from player_number.
+     * amplitudes are simply discarded. A real product would drive its motors
+     * here, and its player LEDs from player_number. We intentionally do NOT log
+     * per-STATUS data: the dongle polls at the report rate, so printing here
+     * would flood the terminal (see the periodic stats line instead).
      */
-    printf("[WLAN] STATUS transport=%u player=%u rumble L/R=%u/%u brake L/R=%u/%u\n",
-           _wlan_status.player_number,
-           _wlan_status.rumble.left, _wlan_status.rumble.right,
-           _wlan_status.brake.left, _wlan_status.brake.right);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -329,12 +347,9 @@ static void _ns_wlan_process_packet(const dongle_pkt_s *rx)
 
     bool send_reply = true;
 
-    
-
     switch ((dongle_pid_t)rx->id)
     {
     case DONGLE_PID_WAKE:
-        printf("GOT WAKE\n");
         /* Only beacons (len == 0) get a WAKE reply, and only the first one in a
          * run of repeats: the dongle floods beacons until we are acknowledged,
          * but replying to each restarts our input/session and spams the host. */
@@ -350,7 +365,6 @@ static void _ns_wlan_process_packet(const dongle_pkt_s *rx)
         break;
 
     case DONGLE_PID_STATUS:
-        printf("GOT STATUS\n");
         /* Any non-WAKE traffic means the dongle has advanced past the beacon
          * phase, so re-arm WAKE handling for the next beacon run. */
         _wlan_wake_replied = false;
@@ -368,7 +382,6 @@ static void _ns_wlan_process_packet(const dongle_pkt_s *rx)
         break;
 
     case DONGLE_PID_CORE_RELIABLE:
-        printf("GOT RELIABLE\n");
         /* Non-WAKE traffic: re-arm WAKE handling (see STATUS case above). */
         _wlan_wake_replied = false;
         if (!_wlan_link_up)
@@ -391,12 +404,10 @@ static void _ns_wlan_process_packet(const dongle_pkt_s *rx)
              * a reply below, echoing rx.ack so the dongle can retire the packet. */
             if (_wlan_have_reliable_ack && rx->ack == _wlan_last_reliable_ack)
             {
-                printf("[WLAN] CORE_RELIABLE dup ack=0x%04X dropped\n", rx->ack);
+                /* Duplicate resend; silently re-ack below without re-tunneling. */
             }
             else
             {
-                printf("[WLAN] CORE_RELIABLE host OUT len=%u id=0x%02X ack=0x%04X\n",
-                       rx->len, rx->data[0], rx->ack);
                 ns_api_output_tunnel(rx->data, rx->len);
                 _wlan_last_reliable_ack = rx->ack;
                 _wlan_have_reliable_ack = true;
@@ -420,7 +431,6 @@ static void _ns_wlan_process_packet(const dongle_pkt_s *rx)
 
     if (send_reply)
     {
-        printf("SENT REPLY\n");
         _ns_wlan_send(&tx);
     }
 }
@@ -490,6 +500,42 @@ static void _ns_wlan_rx_task(void)
          * overwrite an entry we are still reading. */
         _wlan_rx_tail = (tail + 1u) % NS_WLAN_RX_QUEUE_LEN;
     }
+}
+
+/* Print a single, clean throughput line once per NS_WLAN_STATS_PERIOD_MS.
+ * Reports the live unreliable-input rate (reports/s) and any RX drops seen in
+ * the interval. Called from the main loop; stays quiet until the link is up so
+ * idle boards do not chatter. */
+static void _ns_wlan_report_stats(void)
+{
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    uint32_t elapsed = now - _wlan_stat_last_ms;
+    if (elapsed < NS_WLAN_STATS_PERIOD_MS)
+    {
+        return;
+    }
+
+    uint32_t reports = _wlan_stat_input_reports;
+    _wlan_stat_input_reports = 0;
+    _wlan_stat_last_ms = now;
+
+    /* _wlan_rx_dropped is a free-running counter owned by the RX callback; take
+     * a delta against the last snapshot rather than resetting it, to avoid a
+     * lost increment racing with the background context. */
+    uint32_t dropped_total = _wlan_rx_dropped;
+    uint32_t dropped = dropped_total - _wlan_stat_last_dropped;
+    _wlan_stat_last_dropped = dropped_total;
+
+    if (!_wlan_link_up)
+    {
+        return;
+    }
+
+    /* Normalize to a per-second rate in case the loop tick drifts. */
+    uint32_t rate = (elapsed > 0) ? (reports * 1000u) / elapsed : reports;
+
+    printf("[WLAN] input %lu rep/s | dropped %lu\n",
+           (unsigned long)rate, (unsigned long)dropped);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -582,6 +628,49 @@ static bool _ns_wlan_bind(void)
     return true;
 }
 
+/* Tear down the UDP socket. Safe to call with no socket bound. Must run before
+ * cyw43_arch_deinit() so the lwIP lock is still valid. */
+static void _ns_wlan_unbind(void)
+{
+    if (_wlan_pcb != NULL)
+    {
+        cyw43_arch_lwip_begin();
+        udp_remove(_wlan_pcb);
+        cyw43_arch_lwip_end();
+        _wlan_pcb = NULL;
+    }
+}
+
+/* Full radio bring-up: init the cyw43 driver, associate to the dongle AP, pin
+ * our static IP, and bind UDP. Returns false (after cleaning up) if init or
+ * bind fails; association itself retries internally until it succeeds. */
+static bool _ns_wlan_bringup(void)
+{
+    if (cyw43_arch_init())
+    {
+        printf("[WLAN] cyw43_arch_init() failed\n");
+        return false;
+    }
+
+    _ns_wlan_connect();
+
+    if (!_ns_wlan_bind())
+    {
+        cyw43_arch_deinit();
+        return false;
+    }
+
+    return true;
+}
+
+/* Full radio teardown: drop the UDP socket and power down / de-init the cyw43
+ * driver. Pairs with _ns_wlan_bringup() for a clean re-initialization. */
+static void _ns_wlan_teardown(void)
+{
+    _ns_wlan_unbind();
+    cyw43_arch_deinit();
+}
+
 void ns_wlan_enter(void)
 {
     printf("[WLAN] Entering HOJA dongle Switch mode\n");
@@ -593,12 +682,6 @@ void ns_wlan_enter(void)
         printf("[WLAN] WARNING: could not read NS-LIB vid/pid; using 0/0\n");
     }
 
-    if (cyw43_arch_init())
-    {
-        printf("[WLAN] cyw43_arch_init() failed\n");
-        return;
-    }
-
     /* Destination for every reply: the dongle AP. */
     IP4_ADDR(ip_2_ip4(&_wlan_dongle_addr),
              NS_WLAN_DONGLE_IP0, NS_WLAN_DONGLE_IP1, NS_WLAN_DONGLE_IP2, NS_WLAN_DONGLE_IP3);
@@ -607,19 +690,17 @@ void ns_wlan_enter(void)
     /* Pick the first session id before any traffic flows. */
     _ns_wlan_refresh_wake();
 
-    _ns_wlan_connect();
-
-    if (!_ns_wlan_bind())
+    while (!_ns_wlan_bringup())
     {
-        cyw43_arch_deinit();
-        return;
+        printf("[WLAN] Bring-up failed, retrying in 1s\n");
+        sleep_ms(1000);
     }
 
     /*
      * Reactive loop: the UDP receive callback only queues datagrams; here we
      * drain that FIFO and run all protocol work (one reply per datagram), then
-     * service deferred flash writes and watch the Wi-Fi link so we can rejoin
-     * (with a fresh session id) if the AP drops.
+     * service deferred flash writes, print throughput stats, and watch the
+     * Wi-Fi link so we can recover if the AP drops.
      */
     for (;;)
     {
@@ -627,10 +708,12 @@ void ns_wlan_enter(void)
 
         ns_flash_task();
 
+        _ns_wlan_report_stats();
+
         int link = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
         if (link != CYW43_LINK_UP)
         {
-            printf("[WLAN] Link lost (status=%d), reconnecting\n", link);
+            printf("[WLAN] Link lost (status=%d), reinitializing radio\n", link);
             _wlan_link_up = false;
             _wlan_transport_connected = false;
             _wlan_wake_replied = false;
@@ -641,9 +724,21 @@ void ns_wlan_enter(void)
              * while the link is down, so resetting both indices is safe. */
             _wlan_rx_tail = _wlan_rx_head;
 
-            /* A reconnect is a new logical session per the protocol guide. */
+            /*
+             * A dropped link is recovered by fully cycling the radio: bring the
+             * cyw43 driver all the way down and re-initialize it, rather than
+             * just re-associating on the existing instance. This clears any
+             * wedged driver/netif state. A reconnect is also a new logical
+             * session per the protocol guide, so refresh the session id.
+             */
+            _ns_wlan_teardown();
             _ns_wlan_refresh_wake();
-            _ns_wlan_connect();
+
+            while (!_ns_wlan_bringup())
+            {
+                printf("[WLAN] Re-init failed, retrying in 1s\n");
+                sleep_ms(1000);
+            }
         }
 
         sleep_ms(1);
