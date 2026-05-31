@@ -50,6 +50,7 @@ add_executable(Pico-W-NS-Example
     main.c 
     ns_usb.c 
     ns_btc.c 
+    ns_wlan.c 
     ns_flash.c 
 )
 
@@ -69,11 +70,9 @@ target_link_libraries(Pico-W-NS-Example
         pico_rand
 )
 
-# The example only needs CYW43 for Bluetooth, not Wi-Fi networking.
-target_compile_definitions(Pico-W-NS-Example
-  INTERFACE
-  CYW43_LWIP=0
-)
+# The WLAN dongle transport needs the CYW43 Wi-Fi + lwIP stack, while the
+# Bluetooth path needs BTstack. The lwip_threadsafe_background cyw43_arch
+# variant supports both simultaneously, so CYW43_LWIP is left enabled.
 
 # Local includes for the example sources.
 target_include_directories(Pico-W-NS-Example PRIVATE
@@ -83,9 +82,13 @@ target_include_directories(Pico-W-NS-Example PRIVATE
 # Import NS-LIB-HID library
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/external/NS-LIB-HID")
 
+# Import HOJA-LIB-DONGLE (shared wire types/constants for the WLAN dongle protocol).
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/external/HOJA-LIB-DONGLE")
+
 # Link the protocol/descriptor library used by both USB and Bluetooth transports.
 target_link_libraries(Pico-W-NS-Example
     ns_lib_hid
+    hoja_lib_dongle
 )
 
 # TinyUSB powers the wired HID transport path.
@@ -94,9 +97,11 @@ target_link_libraries(Pico-W-NS-Example
     tinyusb_board
 )
 
-# Pico W Bluetooth stack pieces required for the Classic HID path.
+# Pico W radio stack. The lwip_threadsafe_background cyw43_arch variant brings
+# up lwIP for the WLAN dongle transport (ns_wlan.c) while still supporting the
+# Bluetooth Classic HID path (ns_btc.c).
 target_link_libraries(Pico-W-NS-Example 
-    pico_cyw43_arch_none 
+    pico_cyw43_arch_lwip_threadsafe_background 
     pico_cyw43_driver 
     pico_btstack_cyw43 
     pico_btstack_hci_transport_cyw43 

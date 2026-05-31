@@ -50,5 +50,6 @@ void ns_flash_init();
 /* Transport entry points selected at boot. */
 void ns_usb_enter(void);
 void ns_btc_enter(uint8_t device_mac[6], bool pairing_mode);
+void ns_wlan_enter(void);
 
 #endif

@@ -25,6 +25,7 @@
 
 static const uint NS_BT_BOOT_PIN = 0;
 static const uint NS_BT_PAIR_BOOT_PIN = 1;
+static const uint NS_WLAN_BOOT_PIN = 3;
 static const uint NS_A_BUTTON_PIN = 14;
 static const uint NS_B_BUTTON_PIN = 15;
 
@@ -33,6 +34,9 @@ typedef struct
 {
     ns_transport_t transport;
     bool pairing_mode;
+    /* HOJA WLAN dongle (Switch) mode. The dongle owns USB, so the library is
+     * still configured with NS_TRANSPORT_USB while this flag selects ns_wlan. */
+    bool wlan_mode;
 } ns_boot_mode_s;
 
 /* Example SPI color data reported by the library when the host queries controller identity. */
@@ -62,9 +66,10 @@ static ns_boot_mode_s ns_get_boot_mode(void)
     ns_boot_mode_s boot_mode = {
         .transport = NS_TRANSPORT_USB,
         .pairing_mode = false,
+        .wlan_mode = false,
     };
 
-    /* GP0/GP1 act as mode straps. The button inputs also use pull-ups, so all inputs are active-low. */
+    /* GP0/GP1/GP3 act as mode straps. The button inputs also use pull-ups, so all inputs are active-low. */
     gpio_init(NS_BT_BOOT_PIN);
     gpio_set_dir(NS_BT_BOOT_PIN, GPIO_IN);
     gpio_pull_up(NS_BT_BOOT_PIN);
@@ -72,6 +77,10 @@ static ns_boot_mode_s ns_get_boot_mode(void)
     gpio_init(NS_BT_PAIR_BOOT_PIN);
     gpio_set_dir(NS_BT_PAIR_BOOT_PIN, GPIO_IN);
     gpio_pull_up(NS_BT_PAIR_BOOT_PIN);
+
+    gpio_init(NS_WLAN_BOOT_PIN);
+    gpio_set_dir(NS_WLAN_BOOT_PIN, GPIO_IN);
+    gpio_pull_up(NS_WLAN_BOOT_PIN);
 
     gpio_init(NS_A_BUTTON_PIN);
     gpio_set_dir(NS_A_BUTTON_PIN, GPIO_IN);
@@ -81,7 +90,17 @@ static ns_boot_mode_s ns_get_boot_mode(void)
     gpio_set_dir(NS_B_BUTTON_PIN, GPIO_IN);
     gpio_pull_up(NS_B_BUTTON_PIN);
 
-    if (!gpio_get(NS_BT_PAIR_BOOT_PIN))
+    if (!gpio_get(NS_WLAN_BOOT_PIN))
+    {
+        /*
+         * HOJA WLAN dongle mode. The dongle presents a Switch USB device to the
+         * console, so the library is configured as USB while the dedicated
+         * ns_wlan transport tunnels reports over Wi-Fi.
+         */
+        boot_mode.transport = NS_TRANSPORT_USB;
+        boot_mode.wlan_mode = true;
+    }
+    else if (!gpio_get(NS_BT_PAIR_BOOT_PIN))
     {
         /* Pairing mode implies Bluetooth transport. */
         boot_mode.transport = NS_TRANSPORT_BTC;
@@ -136,7 +155,12 @@ int main()
     /* Once the library accepts the config, the rest of the app is just transport-specific plumbing. */
     if(ns_api_init(&config) == NS_CONFIG_OK)
     {
-        if (boot_mode.transport == NS_TRANSPORT_BTC)
+        if (boot_mode.wlan_mode)
+        {
+            printf("Entering WLAN dongle mode (Switch)\n");
+            ns_wlan_enter();
+        }
+        else if (boot_mode.transport == NS_TRANSPORT_BTC)
         {
             printf("Entering Bluetooth mode (pairing %s)\n",
                    boot_mode.pairing_mode ? "on" : "off");
