@@ -171,14 +171,16 @@ static volatile uint32_t _wlan_rx_dropped = 0;  /* datagrams discarded because t
 /* Throughput stats.                                                          */
 /*                                                                            */
 /* The dongle polls at the report rate, so logging per packet floods the      */
-/* terminal. Instead we count the unreliable input reports we emit and print  */
-/* a single summary line once per second from the main loop. These counters   */
-/* are only touched on the main-loop context (the RX drain and the stats      */
-/* print both run there), so no synchronization is needed.                    */
+/* terminal. Instead we count the datagrams we receive from the host (via the  */
+/* dongle) and the unreliable input reports we emit back to the dongle, then   */
+/* print a single summary line once per second from the main loop. These       */
+/* counters are only touched on the main-loop context (the RX drain and the    */
+/* stats print both run there), so no synchronization is needed.               */
 /* -------------------------------------------------------------------------- */
 #define NS_WLAN_STATS_PERIOD_MS 1000
 
-static uint32_t _wlan_stat_input_reports = 0;   /* unreliable reports sent this interval. */
+static uint32_t _wlan_stat_rx_packets    = 0;   /* datagrams received from the host this interval. */
+static uint32_t _wlan_stat_input_reports = 0;   /* unreliable reports sent to the dongle this interval. */
 static uint32_t _wlan_stat_last_ms       = 0;   /* timestamp of the last stats print.      */
 static uint32_t _wlan_stat_last_dropped  = 0;   /* _wlan_rx_dropped at the last print.     */
 
@@ -234,7 +236,6 @@ static void _ns_wlan_send(const dongle_pkt_s *tx)
     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(dongle_pkt_s), PBUF_RAM);
     if (p == NULL)
     {
-        cyw43_arch_lwip_end();
         printf("[WLAN] TX drop: pbuf_alloc failed\n");
         return;
     }
@@ -494,6 +495,10 @@ static void _ns_wlan_rx_task(void)
     {
         uint32_t tail = _wlan_rx_tail;
 
+        /* Count every datagram drained from the host so the stats line can
+         * report the inbound receive rate alongside the outbound report rate. */
+        _wlan_stat_rx_packets++;
+
         _ns_wlan_process_packet(&_wlan_rx_queue[tail]);
 
         /* Release the slot only after processing so the producer cannot
@@ -503,7 +508,8 @@ static void _ns_wlan_rx_task(void)
 }
 
 /* Print a single, clean throughput line once per NS_WLAN_STATS_PERIOD_MS.
- * Reports the live unreliable-input rate (reports/s) and any RX drops seen in
+ * Reports the live receive rate from the host (datagrams/s), the unreliable
+ * input report rate sent to the dongle (reports/s), and any RX drops seen in
  * the interval. Called from the main loop; stays quiet until the link is up so
  * idle boards do not chatter. */
 static void _ns_wlan_report_stats(void)
@@ -515,6 +521,8 @@ static void _ns_wlan_report_stats(void)
         return;
     }
 
+    uint32_t rx_packets = _wlan_stat_rx_packets;
+    _wlan_stat_rx_packets = 0;
     uint32_t reports = _wlan_stat_input_reports;
     _wlan_stat_input_reports = 0;
     _wlan_stat_last_ms = now;
@@ -531,11 +539,12 @@ static void _ns_wlan_report_stats(void)
         return;
     }
 
-    /* Normalize to a per-second rate in case the loop tick drifts. */
-    uint32_t rate = (elapsed > 0) ? (reports * 1000u) / elapsed : reports;
+    /* Normalize to per-second rates in case the loop tick drifts. */
+    uint32_t rx_rate     = (elapsed > 0) ? (rx_packets * 1000u) / elapsed : rx_packets;
+    uint32_t report_rate = (elapsed > 0) ? (reports * 1000u) / elapsed : reports;
 
-    printf("[WLAN] input %lu rep/s | dropped %lu\n",
-           (unsigned long)rate, (unsigned long)dropped);
+    printf("[WLAN] rx %lu pkt/s (from host) | input %lu rep/s (to dongle) | dropped %lu\n",
+           (unsigned long)rx_rate, (unsigned long)report_rate, (unsigned long)dropped);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -555,14 +564,12 @@ static void _ns_wlan_apply_static_ip(void)
     IP4_ADDR(&mask, NS_WLAN_NETMASK0, NS_WLAN_NETMASK1, NS_WLAN_NETMASK2, NS_WLAN_NETMASK3);
     IP4_ADDR(&gw, NS_WLAN_DONGLE_IP0, NS_WLAN_DONGLE_IP1, NS_WLAN_DONGLE_IP2, NS_WLAN_DONGLE_IP3);
 
-    cyw43_arch_lwip_begin();
     struct netif *nif = netif_default;
     if (nif != NULL)
     {
         dhcp_stop(nif);
         netif_set_addr(nif, &ip, &mask, &gw);
     }
-    cyw43_arch_lwip_end();
 }
 
 /* Join the dongle AP, retrying until it succeeds, then pin our static IP. */
@@ -634,9 +641,7 @@ static void _ns_wlan_unbind(void)
 {
     if (_wlan_pcb != NULL)
     {
-        cyw43_arch_lwip_begin();
         udp_remove(_wlan_pcb);
-        cyw43_arch_lwip_end();
         _wlan_pcb = NULL;
     }
 }
