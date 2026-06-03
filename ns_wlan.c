@@ -66,7 +66,6 @@
  * silently drops every datagram we send.
  */
 _Static_assert(sizeof(dongle_pkt_s) == 71, "dongle_pkt_s must be packed to 71 bytes");
-_Static_assert(sizeof(dongle_status_u) == 8, "dongle_status_u must be 8 bytes");
 
 /* -------------------------------------------------------------------------- */
 /* Dongle AP credentials and endpoints.                                       */
@@ -115,7 +114,7 @@ static dongle_session_s _wlan_session = {0};
 static dongle_wake_s    _wlan_wake = {0};
 
 /* Last status snapshot delivered by the dongle (rumble / brake / player / link). */
-static dongle_status_u  _wlan_status = {0};
+static dongle_status_s  _wlan_status = {0};
 
 /* True once the dongle has started polling us (WLAN link, dongle side up). */
 static volatile bool    _wlan_link_up = false;
@@ -305,7 +304,7 @@ static void _ns_wlan_build_input_reply(dongle_pkt_s *tx)
  *   - transport_status : whether the console side is actually enumerated.
  * Use transport_status (not link_status) to decide if we are truly "live" on
  * the console for player-LED / haptic feedback purposes. */
-static void _ns_wlan_apply_status(const dongle_status_u *status)
+static void _ns_wlan_apply_status(const dongle_status_s *status)
 {
     _wlan_status = *status;
 
@@ -374,10 +373,10 @@ static void _ns_wlan_process_packet(const dongle_pkt_s *rx)
             _wlan_link_up = true;
             printf("[WLAN] Link up (dongle is polling us)\n");
         }
-        /* A STATUS payload is exactly sizeof(dongle_status_u) (== 8) bytes. */
-        if (rx->len == sizeof(dongle_status_u))
+        /* A STATUS payload is exactly sizeof(dongle_status_s) (== 8) bytes. */
+        if (rx->len == sizeof(dongle_status_s))
         {
-            _ns_wlan_apply_status((const dongle_status_u *)rx->data);
+            _ns_wlan_apply_status((const dongle_status_s *)rx->data);
         }
         _ns_wlan_build_input_reply(&tx);
         break;
