@@ -2,34 +2,45 @@
  * @file ns_wlan.c
  * @brief HOJA WLAN dongle transport (Switch gamepad mode) for the Pico W example.
  *
- * This transport joins the HOJA dongle's private Wi-Fi AP as a station and
- * speaks the dongle's fixed-size UDP protocol (see
- * external/HOJA-LIB-DONGLE/docs/GAMEPAD_IMPLEMENTATION.md).
+ * This file is now a thin PLATFORM ADAPTER for HOJA-LIB-DONGLE. The dongle
+ * gamepad protocol (the respond-only state machine, session/WAKE handling,
+ * status apply, reliable-lane dedup, and input replies) lives in the
+ * platform-agnostic library (external/HOJA-LIB-DONGLE/dongle_gamepad.c). This
+ * file only provides the platform "hooks" the library calls into:
  *
- * The single most important protocol rule is implemented here literally: the
+ *   - radio bring-up / bind (done once in ns_wlan_enter)
+ *   - dongle_api_gamepad_hook_connect_async  -> CYW43 STA association
+ *   - dongle_api_gamepad_hook_link_up        -> CYW43 link status
+ *   - dongle_api_gamepad_hook_apply_static_ip-> pin the gamepad IP via lwIP
+ *   - dongle_api_gamepad_hook_udp_tx         -> lwIP UDP send (the ONLY TX path)
+ *   - dongle_api_gamepad_hook_get_inputreport-> NS-LIB-HID input report
+ *   - dongle_api_gamepad_hook_set_outputreport-> NS-LIB-HID host OUT tunnel
+ *   - dongle_api_gamepad_hook_set_{player,transport,rumble}
+ *   - dongle_api_gamepad_hook_reset_network  -> full radio cycle on link loss
+ *   - dongle_api_hook_get_time_us_u64 / get_rand_u16 -> platform primitives
+ *
+ * The RX path stays here too: the lwIP receive callback validates the datagram
+ * size and feeds it to dongle_api_gamepad_udp_rx(), which processes it inline
+ * (one reply per datagram via the udp_tx hook).
+ *
+ * The single most important protocol rule is enforced by the library: the
  * gamepad is purely reactive. We bind UDP, wait for the dongle to transmit,
  * and emit exactly one datagram in response to each datagram we receive. There
  * is no local timer, keepalive, or background input stream.
  *
- * To absorb bursts, the UDP receive callback does not process datagrams. With
- * the threadsafe-background cyw43_arch it runs in the network background
- * context, so it only validates and copies each datagram into a fixed-size
- * SPSC FIFO. The main loop drains that FIFO and does all protocol work (and
- * the single reply per datagram) on one predictable context.
- *
  * Addressing: the dongle's RX filter only accepts UDP from the gamepad address
  * 192.168.4.16. The dongle DHCP server is supposed to reserve that lease for
- * us, but it can hand out a different address (e.g. 192.168.4.17) if a stale
- * lease exists. After association we keep the DHCP lease when it is already the
- * gamepad address (DONGLE_GAMEPAD_IP*); otherwise we stop DHCP and pin the netif
- * to that address so our source IP is deterministic.
+ * us, but it can hand out a different address. The apply_static_ip hook keeps
+ * the DHCP lease when it is already the gamepad address; otherwise it stops
+ * DHCP and pins the netif to that address so our source IP is deterministic.
  *
  * In Switch mode the dongle exposes a Nintendo Switch / NS HID USB device to
  * the console and tunnels the Switch protocol to us:
- *   - host OUT reports arrive as DONGLE_PID_CORE_RELIABLE payloads, which we
- *     feed straight into ns_api_output_tunnel().
+ *   - host OUT reports arrive as DONGLE_PID_CORE_RELIABLE payloads, which the
+ *     library hands to set_outputreport() -> ns_api_output_tunnel().
  *   - we answer with the 64-byte Switch input report produced by
- *     ns_api_generate_inputreport(), carried in DONGLE_PID_CORE_UNRELIABLE.
+ *     ns_api_generate_inputreport(), supplied via get_inputreport() and carried
+ *     in DONGLE_PID_CORE_UNRELIABLE.
  *
  * Author: Mitchell Cairns
  * Copyright (c) 2026 Hand Held Legend, LLC.
@@ -58,513 +69,95 @@
 
 #include "ns_lib.h"
 #include "dongle.h"
-
-uint16_t dongle_api_hook_get_rand_u16(void)
-{
-    return (uint16_t) (get_rand_32() & 0xFFFF);
-}
-
-/*
- * Compile-time guard from the guide's bring-up checklist (§14): with the
- * mandatory #pragma pack(push,1) the wire struct is exactly 71 bytes
- * (2 + 2 + 1 + 2 + 64). If padding sneaks in, the dongle's length filter
- * silently drops every datagram we send.
- */
-_Static_assert(sizeof(dongle_pkt_s) == 71, "dongle_pkt_s must be packed to 71 bytes");
+#include "dongle_gamepad.h"
 
 /* -------------------------------------------------------------------------- */
-/* Dongle AP credentials and endpoints.                                       */
-/* These mirror §1 of the dongle gamepad implementation guide. Update them    */
-/* here if the dongle firmware changes its SSID / password / IP layout.       */
+/* Platform configuration.                                                    */
+/* SSID / password / IP layout now come from the library (DONGLE_DEFAULT_*    */
+/* and DONGLE_*_IP*); only the CYW43 auth mode and the USB personality we     */
+/* advertise are platform/example choices.                                    */
 /* -------------------------------------------------------------------------- */
-#define NS_WLAN_SSID            "HOJA_WLAN_1234"
-#define NS_WLAN_PASSWORD        "HOJA_1234"
-#define NS_WLAN_AUTH            CYW43_AUTH_WPA2_AES_PSK
-
-/* The dongle (AP) lives at 192.168.4.1 and listens on DONGLE_WLAN_PORT. */
-#define NS_WLAN_DONGLE_IP0      192
-#define NS_WLAN_DONGLE_IP1      168
-#define NS_WLAN_DONGLE_IP2      4
-#define NS_WLAN_DONGLE_IP3      1
-
-/*
- * Our own (gamepad) address. The dongle filters on exactly this source IP
- * (DONGLE_GAMEPAD_IP*). We keep a correct DHCP lease; otherwise we pin it.
- * The gateway is the dongle AP itself.
- */
-#define NS_WLAN_NETMASK0        255
-#define NS_WLAN_NETMASK1        255
-#define NS_WLAN_NETMASK2        255
-#define NS_WLAN_NETMASK3        0
-
-/* How long to wait for a single association attempt before retrying. */
-#define NS_WLAN_CONNECT_TIMEOUT_MS  20000
-
-/* Re-init the radio if no dongle datagrams arrive within this window. */
-#define NS_WLAN_RX_IDLE_TIMEOUT_MS  5000
+#define NS_WLAN_AUTH        CYW43_AUTH_WPA2_AES_PSK
 
 /*
  * USB personality we want the dongle to expose to the console. The dongle
  * applies vid/pid from our WAKE reply when it brings up its Switch USB core.
  */
-#define NS_WLAN_DONGLE_MODE     DONGLE_MODE_SWITCH
+#define NS_WLAN_DONGLE_MODE DONGLE_MODE_SWITCH
+
+/* The Switch steady-state input report id; everything else is reliable. */
+#define NS_WLAN_SWITCH_FULL_REPORT_ID 0x30
 
 /* -------------------------------------------------------------------------- */
-/* Session / link state (the "persistent variables" from §13 of the guide).   */
+/* Adapter state.                                                             */
 /* -------------------------------------------------------------------------- */
 static struct udp_pcb *_wlan_pcb = NULL;
-static ip_addr_t        _wlan_dongle_addr;
 
-/* Current logical session: USB mode (4 bits) + random session id (12 bits). */
-static dongle_session_s _wlan_session = {0};
-
-/* WAKE body we advertise; cached so re-sends stay byte-identical for dedupe. */
-static dongle_wake_s    _wlan_wake = {0};
-
-/* Last status snapshot delivered by the dongle (rumble / brake / player / link). */
-static dongle_status_s  _wlan_status = {0};
-
-/* True once STA association finished and static IP is pinned. */
-static bool             _wlan_sta_ready = false;
-
-/* Retry / attempt deadlines for non-blocking association (see _ns_wlan_connect_poll). */
-static absolute_time_t  _wlan_connect_deadline;
-static absolute_time_t  _wlan_retry_after;
-
-/* Updated on each valid RX datagram (background context); read from main loop. */
-static volatile uint32_t _wlan_last_rx_ms = 0;
-
-/* True once the dongle has started polling us (WLAN link, dongle side up). */
-static volatile bool    _wlan_link_up = false;
-
-/* True while the console side is enumerated (transport_status CONNECTED). */
-static bool             _wlan_transport_connected = false;
-
-/* True once we have replied to a WAKE beacon and not yet seen any other valid
- * packet type. The dongle re-broadcasts WAKE beacons rapidly until the link is
- * established; replying to every one spams a fresh input/session burst, so we
- * answer the first beacon only and stay silent for repeats. Receiving any other
- * valid packet (STATUS / CORE_RELIABLE) means the dongle has moved on, so we
- * clear this and will answer the next WAKE beacon again. */
-static bool             _wlan_wake_replied = false;
-
-/* USB identity advertised to the dongle, pulled from NS-LIB-HID at startup. */
-static uint16_t         _wlan_vid = 0;
-static uint16_t         _wlan_pid = 0;
-
-/* Last CORE_RELIABLE ack token whose host-OUT payload we tunneled into NS-LIB.
- * The dongle uses stop-and-wait: it resends the same CORE_RELIABLE packet (with
- * an identical ack token) until it sees that token echoed back. A given host OUT
- * must be tunneled exactly once; any resend carrying an ack we have already
- * processed is a duplicate and re-queuing it would emit duplicate command
- * replies. The companion bool distinguishes "no reliable payload seen yet" from
- * a legitimately processed ack of 0. Both are cleared on link loss. */
-static uint16_t         _wlan_last_reliable_ack = 0;
-static bool             _wlan_have_reliable_ack = false;
-
-/* -------------------------------------------------------------------------- */
-/* RX FIFO (single-producer / single-consumer ring buffer).                   */
-/*                                                                            */
-/* With pico_cyw43_arch_lwip_threadsafe_background the UDP receive callback   */
-/* runs in the cyw43 background (IRQ) context and can preempt the main loop.  */
-/* To absorb bursts of datagrams and keep all protocol work on one context,   */
-/* the callback only copies each datagram into this queue (producer) and the  */
-/* main loop drains and processes it (consumer).                              */
-/*                                                                            */
-/* This is a classic lock-free SPSC ring: the producer owns _wlan_rx_head,    */
-/* the consumer owns _wlan_rx_tail, and one slot is always left empty to tell */
-/* "full" from "empty". Word-sized index loads/stores are atomic on the core, */
-/* so no locking is needed as long as there is exactly one of each. The queue */
-/* holds NS_WLAN_RX_QUEUE_LEN slots, i.e. NS_WLAN_RX_QUEUE_LEN - 1 usable.    */
-/* -------------------------------------------------------------------------- */
-static volatile uint32_t _wlan_rx_dropped = 0;  /* datagrams discarded because the queue was full. */
-
-/* -------------------------------------------------------------------------- */
-/* Throughput stats.                                                          */
-/*                                                                            */
-/* The dongle polls at the report rate, so logging per packet floods the      */
-/* terminal. Instead we count the datagrams we receive from the host (via the  */
-/* dongle) and the unreliable input reports we emit back to the dongle, then   */
-/* print a single summary line once per second from the main loop. These       */
-/* counters are only touched on the main-loop context (the RX drain and the    */
-/* stats print both run there), so no synchronization is needed.               */
-/* -------------------------------------------------------------------------- */
-#define NS_WLAN_STATS_PERIOD_MS 1000
-
-static uint32_t _wlan_stat_rx_packets    = 0;   /* datagrams received from the host this interval. */
-static uint32_t _wlan_stat_input_reports = 0;   /* unreliable reports sent to the dongle this interval. */
-static uint32_t _wlan_stat_last_ms       = 0;   /* timestamp of the last stats print.      */
-static uint32_t _wlan_stat_last_dropped  = 0;   /* _wlan_rx_dropped at the last print.     */
-
-/* -------------------------------------------------------------------------- */
-/* Helpers                                                                    */
-/* -------------------------------------------------------------------------- */
-
-static void _ns_wlan_touch_rx(void)
-{
-    _wlan_last_rx_ms = to_ms_since_boot(get_absolute_time());
-}
-
-static bool _ns_wlan_rx_idle_expired(void)
-{
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    uint32_t last = _wlan_last_rx_ms;
-    return (now - last) >= NS_WLAN_RX_IDLE_TIMEOUT_MS;
-}
-
-/* Pick a fresh 12-bit session id (1..0xFFF). A new id tells the dongle that a
- * new client attached or the gamepad rebooted, forcing a clean core_init. */
-static uint16_t _ns_wlan_new_session_id(void)
-{
-    uint16_t sid = (uint16_t)(get_rand_32() & 0x0FFFu);
-    if (sid == 0)
-    {
-        sid = 1;
-    }
-    return sid;
-}
-
-/* Refresh the cached WAKE body for the current mode / session / USB identity. */
-static void _ns_wlan_refresh_wake(void)
-{
-    _wlan_session.mode = DONGLE_MODE_SWITCH;
-    _wlan_session.id   = _ns_wlan_new_session_id();
-
-    /*
-     * dongle_wake_s.session is the PACKED uint16_t (identical to pkt->session),
-     * NOT a nested dongle_session_s struct (guide §4). Pack it explicitly.
-     */
-    _wlan_wake.session = dongle_session_pack(&_wlan_session);
-    _wlan_wake.vid     = _wlan_vid;
-    _wlan_wake.pid     = _wlan_pid;
-
-    printf("[WLAN] New session id 0x%03X (mode %u, vid 0x%04X, pid 0x%04X)\n",
-           _wlan_session.id, _wlan_session.mode, _wlan_vid, _wlan_pid);
-}
-
-/* Transmit exactly one fully-formed dongle_pkt_s to the dongle. This is the
- * ONLY place WLAN traffic ever leaves the gamepad, and it is only reachable
- * from the RX queue drain that runs in the main loop.
- *
- * Because this now executes in thread context (not inside an lwIP callback),
- * the lwIP calls below are bracketed with cyw43_arch_lwip_begin()/end() to
- * take the stack lock against the background context. */
-static void _ns_wlan_send(const dongle_pkt_s *tx)
-{
-    if (_wlan_pcb == NULL || tx == NULL)
-    {
-        return;
-    }
-
-    /* Always transmit the full fixed structure; bytes past len stay zeroed. */
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(dongle_pkt_s), PBUF_RAM);
-    if (p == NULL)
-    {
-        printf("[WLAN] TX drop: pbuf_alloc failed\n");
-        return;
-    }
-
-    memcpy(p->payload, tx, sizeof(dongle_pkt_s));
-
-    err_t err = udp_sendto(_wlan_pcb, p, &_wlan_dongle_addr, DONGLE_WLAN_PORT);
-
-    pbuf_free(p);
-
-    if (err != ERR_OK)
-    {
-        printf("[WLAN] TX error: udp_sendto -> %d\n", (int)err);
-    }
-}
-
-/* Build a WAKE reply to a dongle WAKE beacon. */
-static void _ns_wlan_build_wake_reply(dongle_pkt_s *tx)
-{
-    tx->session = dongle_session_pack(&_wlan_session);
-    tx->id      = DONGLE_PID_WAKE;
-    tx->len     = (uint16_t)sizeof(dongle_wake_s);
-    memcpy(tx->data, &_wlan_wake, sizeof(dongle_wake_s));
-
-    if (!_wlan_link_up)
-    {
-        printf("[WLAN] Replying to WAKE beacon (session 0x%03X)\n", _wlan_session.id);
-    }
-}
-
-/* Build the current Switch input report into a CORE_UNRELIABLE reply. */
-static void _ns_wlan_build_input_reply(dongle_pkt_s *tx)
-{
-    uint8_t report[64] = {0};
-
-    tx->id = DONGLE_PID_CORE_UNRELIABLE;
-
-    if (ns_api_generate_inputreport(report))
-    {
-        tx->id = (report[0] == 0x30) ? DONGLE_PID_CORE_UNRELIABLE : DONGLE_PID_CORE_RELIABLE;
-
-        /* Count the steady-state unreliable input reports so the main loop can
-         * print a clean per-second input rate (see _ns_wlan_report_stats). */
-        if (tx->id == DONGLE_PID_CORE_UNRELIABLE)
-        {
-            _wlan_stat_input_reports++;
-        }
-
-        /* In Switch mode the whole 64-byte report (report id at byte 0) is the
-         * CORE_UNRELIABLE payload the dongle relays to the console. */
-        tx->len = 64;
-        memcpy(tx->data, report, 64);
-    }
-    else
-    {
-        /* Nothing to report this poll. Still answer (one reply per RX) so the
-         * dongle watchdog stays fed and any ack we owe is delivered. */
-        tx->len = 0;
-    }
-}
-
-/* Apply a STATUS payload (link / transport / player / rumble / brake).
- *
- * Per guide §11 the old single "connection" field is gone; status now carries
- * two independent fields:
- *   - link_status      : the wireless link (owned by the dongle WLAN core).
- *   - transport_status : whether the console side is actually enumerated.
- * Use transport_status (not link_status) to decide if we are truly "live" on
- * the console for player-LED / haptic feedback purposes. */
-static void _ns_wlan_apply_status(const dongle_status_s *status)
-{
-    _wlan_status = *status;
-
-    bool connected = (_wlan_status.transport_status == DONGLE_TRANSPORT_CONNECTED);
-    if (connected != _wlan_transport_connected)
-    {
-        _wlan_transport_connected = connected;
-        printf("[WLAN] Console transport %s\n",
-               connected ? "CONNECTED" : "IDLE");
-    }
-
-    /*
-     * No physical actuator is wired into this example, so the rumble/brake
-     * amplitudes are simply discarded. A real product would drive its motors
-     * here, and its player LEDs from player_number. We intentionally do NOT log
-     * per-STATUS data: the dongle polls at the report rate, so printing here
-     * would flood the terminal (see the periodic stats line instead).
-     */
-}
-
-/* -------------------------------------------------------------------------- */
-/* Packet processing: the heart of the respond-only protocol.                 */
-/* One dongle datagram in -> at most one gamepad datagram out.                */
-/*                                                                            */
-/* This runs in the main loop (consumer side of the RX FIFO), so every call   */
-/* into NS-LIB and lwIP happens on a single, predictable context.             */
-/* -------------------------------------------------------------------------- */
-static void _ns_wlan_process_packet(const dongle_pkt_s *rx)
-{
-    /*
-     * Prepare a zeroed reply tagged with our session. Echo this datagram's ack
-     * token directly: the dongle checks pkt->ack on every RX, so echoing rx.ack
-     * on any reply opportunistically retires whatever it has inflight and is the
-     * documented, robust behavior (guide §9). It is harmless on non-reliable
-     * traffic, where rx.ack is simply 0.
-     */
-    dongle_pkt_s tx = {0};
-    tx.session = dongle_session_pack(&_wlan_session);
-    tx.ack     = rx->ack;
-
-    bool send_reply = true;
-
-    switch ((dongle_pid_t)rx->id)
-    {
-    case DONGLE_PID_WAKE:
-        /* Only beacons (len == 0) get a WAKE reply, and only the first one in a
-         * run of repeats: the dongle floods beacons until we are acknowledged,
-         * but replying to each restarts our input/session and spams the host. */
-        if (rx->len == 0 && !_wlan_wake_replied)
-        {
-            _ns_wlan_build_wake_reply(&tx);
-            _wlan_wake_replied = true;
-        }
-        else
-        {
-            send_reply = false;
-        }
-        break;
-
-    case DONGLE_PID_STATUS:
-        /* Any non-WAKE traffic means the dongle has advanced past the beacon
-         * phase, so re-arm WAKE handling for the next beacon run. */
-        _wlan_wake_replied = false;
-        if (!_wlan_link_up)
-        {
-            _wlan_link_up = true;
-            printf("[WLAN] Link up (dongle is polling us)\n");
-        }
-        /* A STATUS payload is exactly sizeof(dongle_status_s) (== 8) bytes. */
-        if (rx->len == sizeof(dongle_status_s))
-        {
-            _ns_wlan_apply_status((const dongle_status_s *)rx->data);
-        }
-        _ns_wlan_build_input_reply(&tx);
-        break;
-
-    case DONGLE_PID_CORE_RELIABLE:
-        /* Non-WAKE traffic: re-arm WAKE handling (see STATUS case above). */
-        _wlan_wake_replied = false;
-        if (!_wlan_link_up)
-        {
-            _wlan_link_up = true;
-            printf("[WLAN] Link up (dongle is polling us)\n");
-        }
-        /* Host OUT (Switch commands / rumble). Hand it to the protocol engine;
-         * any reply it queues is popped by the input report build below and
-         * delivered in this same reply. rx->ack was already echoed into tx.ack
-         * above, which retires the dongle's inflight reliable packet (guide §9).
-         * ns_api_output_tunnel() is effectively idempotent on resends. */
-        if (rx->len > 0)
-        {
-            /* Stop-and-wait dedup: the dongle resends the same CORE_RELIABLE
-             * packet (identical ack token) until it sees the token echoed back.
-             * Tunnel each host OUT exactly once; a resend carrying an ack we have
-             * already processed is a duplicate and must not be re-queued (doing so
-             * would emit duplicate command replies). We still fall through to send
-             * a reply below, echoing rx.ack so the dongle can retire the packet. */
-            if (_wlan_have_reliable_ack && rx->ack == _wlan_last_reliable_ack)
-            {
-                /* Duplicate resend; silently re-ack below without re-tunneling. */
-            }
-            else
-            {
-                ns_api_output_tunnel(rx->data, rx->len);
-                _wlan_last_reliable_ack = rx->ack;
-                _wlan_have_reliable_ack = true;
-            }
-        }
-        _ns_wlan_build_input_reply(&tx);
-        break;
-
-    case DONGLE_PID_BULK_UNRELIABLE:
-    case DONGLE_PID_CONFIG_RELIABLE:
-        /* Reserved endpoints (webUSB bulk / config bulk) — not yet fleshed out
-         * on the dongle (guide §5). Ignore them and stay silent for now. */
-        send_reply = false;
-        break;
-
-    default:
-        /* Dongle sent something we do not answer. Stay silent (no proactive TX). */
-        send_reply = false;
-        break;
-    }
-
-    if (send_reply)
-    {
-        _ns_wlan_send(&tx);
-    }
-}
-
-/* -------------------------------------------------------------------------- */
-/* UDP receive callback (producer).                                           */
-/*                                                                            */
-/* Runs in the cyw43 background context. Keep it as short as possible: just   */
-/* validate the datagram length and copy it into the RX FIFO. All protocol    */
-/* work is deferred to _ns_wlan_rx_task() on the main loop. This lets a burst */
-/* of datagrams queue up instead of forcing a reply (and an NS-LIB call) from */
-/* inside the network callback.                                               */
-/* -------------------------------------------------------------------------- */
-
+/* Scratch RX packet reused by the lwIP receive callback. */
 static dongle_pkt_s _rx_pkt;
 
-static void _ns_wlan_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
-                              const ip_addr_t *addr, u16_t port)
+/* Forward declaration: used by the network-reset hook to re-bind. */
+static bool _ns_wlan_bind(void);
+
+/* -------------------------------------------------------------------------- */
+/* Generic utility hooks (dongle.h)                                           */
+/* -------------------------------------------------------------------------- */
+
+uint16_t dongle_api_hook_get_rand_u16(void)
 {
-    (void)arg;
-    (void)pcb;
-    (void)addr;
-    (void)port;
-
-    if (p == NULL)
-    {
-        return;
-    }
-
-    /* The dongle only ever sends a full, fixed-size dongle_pkt_s. Anything else
-     * is not part of the protocol, so drop it without queueing. */
-    if (p->tot_len != sizeof(dongle_pkt_s))
-    {
-        printf("[WLAN] RX drop: unexpected length %u (want %u)\n",
-               p->tot_len, (unsigned)sizeof(dongle_pkt_s));
-        pbuf_free(p);
-        return;
-    }
-
-    pbuf_copy_partial(p, &_rx_pkt, sizeof(dongle_pkt_s), 0);
-    pbuf_free(p);
-
-    _ns_wlan_touch_rx();
-    _wlan_stat_rx_packets++;
-
-    // Process test
-    _ns_wlan_process_packet(&_rx_pkt);
+    return (uint16_t)(get_rand_32() & 0xFFFF);
 }
 
-/* Print a single, clean throughput line once per NS_WLAN_STATS_PERIOD_MS.
- * Reports the live receive rate from the host (datagrams/s), the unreliable
- * input report rate sent to the dongle (reports/s), and any RX drops seen in
- * the interval. Called from the main loop; stays quiet until the link is up so
- * idle boards do not chatter. */
-static void _ns_wlan_report_stats(void)
+uint64_t dongle_api_hook_get_time_us_u64(void)
 {
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    uint32_t elapsed = now - _wlan_stat_last_ms;
-    if (elapsed < NS_WLAN_STATS_PERIOD_MS)
-    {
-        return;
-    }
-
-    uint32_t rx_packets = _wlan_stat_rx_packets;
-    _wlan_stat_rx_packets = 0;
-    uint32_t reports = _wlan_stat_input_reports;
-    _wlan_stat_input_reports = 0;
-    _wlan_stat_last_ms = now;
-
-    /* _wlan_rx_dropped is a free-running counter owned by the RX callback; take
-     * a delta against the last snapshot rather than resetting it, to avoid a
-     * lost increment racing with the background context. */
-    uint32_t dropped_total = _wlan_rx_dropped;
-    uint32_t dropped = dropped_total - _wlan_stat_last_dropped;
-    _wlan_stat_last_dropped = dropped_total;
-
-    if (!_wlan_link_up)
-    {
-        return;
-    }
-
-    /* Normalize to per-second rates in case the loop tick drifts. */
-    uint32_t rx_rate     = (elapsed > 0) ? (rx_packets * 1000u) / elapsed : rx_packets;
-    uint32_t report_rate = (elapsed > 0) ? (reports * 1000u) / elapsed : reports;
-
-    printf("[WLAN] rx %lu pkt/s (from host) | input %lu rep/s (to dongle) | dropped %lu\n",
-           (unsigned long)rx_rate, (unsigned long)report_rate, (unsigned long)dropped);
+    return time_us_64();
 }
 
 /* -------------------------------------------------------------------------- */
-/* Association / bring-up                                                      */
+/* Gamepad hooks (dongle_gamepad.h)                                           */
 /* -------------------------------------------------------------------------- */
+
+/* Map the CYW43 station link status onto the library's link enum. */
+dongle_link_status_t dongle_api_gamepad_hook_link_up(void)
+{
+    int link = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+    return (link == CYW43_LINK_UP) ? DONGLE_LINK_UP : DONGLE_LINK_DOWN;
+}
+
+/* Start a non-blocking join to the dongle AP. Completion (static IP) is driven
+ * by the library poll via dongle_api_gamepad_hook_apply_static_ip(). */
+void dongle_api_gamepad_hook_connect_async(const char *ssid, const char *pw)
+{
+    cyw43_arch_enable_sta_mode();
+    cyw43_wifi_set_roam_enabled(&cyw43_state, false);
+    cyw43_wifi_set_interference_mode(&cyw43_state, CYW43_IFMODE_NONE);
+
+    printf("[WLAN] Station mode enabled, joining SSID \"%s\"\n", ssid);
+
+    int rc = cyw43_arch_wifi_connect_async(ssid, pw, NS_WLAN_AUTH);
+    if (rc != 0)
+    {
+        printf("[WLAN] connect_async failed (rc=%d)\n", rc);
+    }
+}
 
 /*
  * Ensure the station uses the gamepad address the dongle filters on. lwIP /
  * cyw43_arch run DHCP on link-up. dhcp_stop() always clears the netif, so we
- * re-apply DONGLE_GAMEPAD_IP* afterward (a no-op when DHCP already offered it).
+ * re-apply the target address afterward (a no-op when DHCP already offered it).
+ * Returns true once the interface holds the gamepad address.
  */
-static void _ns_wlan_apply_static_ip(void)
+bool dongle_api_gamepad_hook_apply_static_ip(uint8_t addr[4], uint8_t mask[4], uint8_t gateway[4])
 {
-    ip4_addr_t target, mask, gw;
-    IP4_ADDR(&target, DONGLE_GAMEPAD_IP0, DONGLE_GAMEPAD_IP1, DONGLE_GAMEPAD_IP2, DONGLE_GAMEPAD_IP3);
-    IP4_ADDR(&mask, NS_WLAN_NETMASK0, NS_WLAN_NETMASK1, NS_WLAN_NETMASK2, NS_WLAN_NETMASK3);
-    IP4_ADDR(&gw, NS_WLAN_DONGLE_IP0, NS_WLAN_DONGLE_IP1, NS_WLAN_DONGLE_IP2, NS_WLAN_DONGLE_IP3);
+    ip4_addr_t target, m, gw;
+    IP4_ADDR(&target, addr[0], addr[1], addr[2], addr[3]);
+    IP4_ADDR(&m, mask[0], mask[1], mask[2], mask[3]);
+    IP4_ADDR(&gw, gateway[0], gateway[1], gateway[2], gateway[3]);
 
     struct netif *nif = netif_default;
     if (nif == NULL)
     {
-        return;
+        return false;
     }
 
     const ip4_addr_t *current = netif_ip4_addr(nif);
@@ -581,7 +174,10 @@ static void _ns_wlan_apply_static_ip(void)
      * offered the correct lease.
      */
     dhcp_stop(nif);
-    netif_set_addr(nif, &target, &mask, &gw);
+    netif_set_addr(nif, &target, &m, &gw);
+
+    /* Disable Wi-Fi power management for deterministic, low-latency polling. */
+    cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);
 
     if (dhcp_had_target)
     {
@@ -589,90 +185,159 @@ static void _ns_wlan_apply_static_ip(void)
     }
     else
     {
-        printf("[WLAN] Using static gamepad IP %s (gw 192.168.4.1)\n", ip4addr_ntoa(netif_ip4_addr(nif)));
+        printf("[WLAN] Using static gamepad IP %s (gw %s)\n",
+               ip4addr_ntoa(netif_ip4_addr(nif)), ip4addr_ntoa(&gw));
+    }
+
+    return true;
+}
+
+/* Transmit exactly one fully-formed dongle_pkt_s. This is the ONLY place WLAN
+ * traffic ever leaves the gamepad, and it is only reachable from the library's
+ * packet processing, which runs inside the lwIP receive callback. Because that
+ * is the lwIP/background context, the udp_sendto below needs no extra locking. */
+void dongle_api_gamepad_hook_udp_tx(const dongle_pkt_s *pkt, uint8_t ip[4], uint16_t port)
+{
+    if (_wlan_pcb == NULL || pkt == NULL)
+    {
+        return;
+    }
+
+    /* Always transmit the full fixed structure; bytes past len stay zeroed. */
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(dongle_pkt_s), PBUF_RAM);
+    if (p == NULL)
+    {
+        printf("[WLAN] TX drop: pbuf_alloc failed\n");
+        return;
+    }
+
+    memcpy(p->payload, pkt, sizeof(dongle_pkt_s));
+
+    ip_addr_t dst;
+    IP4_ADDR(ip_2_ip4(&dst), ip[0], ip[1], ip[2], ip[3]);
+    IP_SET_TYPE(&dst, IPADDR_TYPE_V4);
+
+    err_t err = udp_sendto(_wlan_pcb, p, &dst, port);
+
+    pbuf_free(p);
+
+    if (err != ERR_OK)
+    {
+        printf("[WLAN] TX error: udp_sendto -> %d\n", (int)err);
     }
 }
 
-/* Start a non-blocking join to the dongle AP. Completion (static IP, PM) is handled
- * by _ns_wlan_connect_poll() from the main loop. */
-static void _ns_wlan_connect(void)
+/* Provide the latest Switch input report from NS-LIB-HID. The whole 64-byte
+ * report (report id at byte 0) is the payload the dongle relays to the console.
+ * Steady-state full reports (id 0x30) ride the unreliable lane; anything else
+ * (command replies) rides the reliable lane. */
+bool dongle_api_gamepad_hook_get_inputreport(uint8_t data[64], uint16_t *len, bool *reliable)
 {
-    cyw43_arch_enable_sta_mode();
-    cyw43_wifi_set_roam_enabled(&cyw43_state, false);
-    cyw43_wifi_set_interference_mode(&cyw43_state, CYW43_IFMODE_NONE);
+    uint8_t report[64] = {0};
 
-    printf("[WLAN] Station mode enabled, joining SSID \"%s\"\n", NS_WLAN_SSID);
-
-    _wlan_sta_ready = false;
-    _wlan_retry_after = get_absolute_time();
-    _wlan_connect_deadline = make_timeout_time_ms(NS_WLAN_CONNECT_TIMEOUT_MS);
-
-    printf("[WLAN] Associating...\n");
-    int rc = cyw43_arch_wifi_connect_async(NS_WLAN_SSID, NS_WLAN_PASSWORD, NS_WLAN_AUTH);
-    if (rc != 0)
+    if (!ns_api_generate_inputreport(report))
     {
-        printf("[WLAN] connect_async failed (rc=%d)\n", rc);
+        return false;
+    }
+
+    memcpy(data, report, 64);
+    *len = 64;
+    *reliable = (report[0] != NS_WLAN_SWITCH_FULL_REPORT_ID);
+    return true;
+}
+
+/* Host OUT (Switch commands / rumble). Feed it straight into NS-LIB-HID. */
+void dongle_api_gamepad_hook_set_outputreport(const uint8_t data[64], uint16_t len)
+{
+    ns_api_output_tunnel(data, len);
+}
+
+void dongle_api_gamepad_hook_set_player(uint8_t player_number)
+{
+    /* No player LED hardware in this example; log the assignment for visibility. */
+    printf("[WLAN] Player number %u\n", player_number);
+}
+
+void dongle_api_gamepad_hook_set_transport(bool connected)
+{
+    printf("[WLAN] Console transport %s\n", connected ? "CONNECTED" : "IDLE");
+}
+
+void dongle_api_gamepad_hook_set_rumble(uint8_t left, uint8_t right, uint8_t left_brake, uint8_t right_brake)
+{
+    /*
+     * No physical actuator is wired into this example, so the rumble/brake
+     * amplitudes are simply discarded. A real product would drive its motors
+     * here.
+     */
+    (void)left;
+    (void)right;
+    (void)left_brake;
+    (void)right_brake;
+}
+
+/* Full radio cycle after the library detects link loss / connect failure.
+ * Pairs the teardown + bring-up so the next connect_async starts clean. The
+ * library re-drives association after this returns (its poll calls
+ * connect_async again while the link reads DOWN). */
+void dongle_api_gamepad_hook_reset_network(void)
+{
+    printf("[WLAN] Reset requested, reinitializing radio\n");
+
+    if (_wlan_pcb != NULL)
+    {
+        udp_remove(_wlan_pcb);
+        _wlan_pcb = NULL;
+    }
+    cyw43_arch_deinit();
+
+    while (cyw43_arch_init())
+    {
+        printf("[WLAN] Re-init failed, retrying in 1s\n");
+        sleep_ms(1000);
+    }
+
+    while (!_ns_wlan_bind())
+    {
+        printf("[WLAN] Re-bind failed, retrying in 1s\n");
+        sleep_ms(1000);
     }
 }
 
-/* Drive async association: pin static IP on LINK_UP; retry on failure / timeout. */
-static void _ns_wlan_connect_poll(void)
+/* -------------------------------------------------------------------------- */
+/* RX path                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/* lwIP receive callback. Runs in the cyw43 background context. Validate the
+ * datagram length and feed it to the library, which processes it inline and
+ * emits at most one reply through dongle_api_gamepad_hook_udp_tx(). */
+static void _ns_wlan_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                              const ip_addr_t *addr, u16_t port)
 {
-    int link = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+    (void)arg;
+    (void)pcb;
+    (void)addr;
+    (void)port;
 
-    if (link == CYW43_LINK_UP)
-    {
-        if (!_wlan_sta_ready)
-        {
-            _ns_wlan_apply_static_ip();
-
-            cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);
-            _wlan_sta_ready = true;
-            _ns_wlan_touch_rx();
-        }
-        return;
-    }
-
-    if (_wlan_sta_ready)
+    if (p == NULL)
     {
         return;
     }
 
-    if (!time_reached(_wlan_retry_after))
+    /* The dongle only ever sends a full, fixed-size dongle_pkt_s. Anything else
+     * is not part of the protocol, so drop it. */
+    if (p->tot_len != sizeof(dongle_pkt_s))
     {
+        printf("[WLAN] RX drop: unexpected length %u (want %u)\n",
+               p->tot_len, (unsigned)sizeof(dongle_pkt_s));
+        pbuf_free(p);
         return;
     }
 
-    bool retry = false;
-    if (link == CYW43_LINK_NONET)
-    {
-        retry = true;
-    }
-    else if (link == CYW43_LINK_FAIL || link == CYW43_LINK_BADAUTH)
-    {
-        printf("[WLAN] Association failed (status=%d), retrying in 1s\n", link);
-        retry = true;
-    }
-    else if (time_reached(_wlan_connect_deadline))
-    {
-        printf("[WLAN] Association timeout, retrying\n");
-        retry = true;
-    }
+    pbuf_copy_partial(p, &_rx_pkt, sizeof(dongle_pkt_s), 0);
+    pbuf_free(p);
 
-    if (!retry)
-    {
-        return;
-    }
-
-    printf("[WLAN] Associating...\n");
-    int rc = cyw43_arch_wifi_connect_async(NS_WLAN_SSID, NS_WLAN_PASSWORD, NS_WLAN_AUTH);
-    if (rc != 0)
-    {
-        printf("[WLAN] connect_async failed (rc=%d)\n", rc);
-    }
-
-    _wlan_retry_after = make_timeout_time_ms(1000);
-    _wlan_connect_deadline = make_timeout_time_ms(NS_WLAN_CONNECT_TIMEOUT_MS);
+    dongle_api_gamepad_udp_rx(&_rx_pkt);
 }
 
 /* Bind UDP port 4444 and register the receive callback. */
@@ -700,69 +365,9 @@ static bool _ns_wlan_bind(void)
     return true;
 }
 
-/* Tear down the UDP socket. Safe to call with no socket bound. Must run before
- * cyw43_arch_deinit() so the lwIP lock is still valid. */
-static void _ns_wlan_unbind(void)
-{
-    if (_wlan_pcb != NULL)
-    {
-        udp_remove(_wlan_pcb);
-        _wlan_pcb = NULL;
-    }
-}
-
-/* Full radio bring-up: init the cyw43 driver, start async association, and bind
- * UDP. Returns false (after cleaning up) if init or bind fails; association
- * completes in the main loop via _ns_wlan_connect_poll(). */
-static bool _ns_wlan_bringup(void)
-{
-    if (cyw43_arch_init())
-    {
-        printf("[WLAN] cyw43_arch_init() failed\n");
-        return false;
-    }
-
-    _ns_wlan_connect();
-
-    if (!_ns_wlan_bind())
-    {
-        cyw43_arch_deinit();
-        return false;
-    }
-
-    return true;
-}
-
-/* Full radio teardown: drop the UDP socket and power down / de-init the cyw43
- * driver. Pairs with _ns_wlan_bringup() for a clean re-initialization. */
-static void _ns_wlan_teardown(void)
-{
-    _wlan_sta_ready = false;
-    _ns_wlan_unbind();
-    cyw43_arch_deinit();
-}
-
-/* Full radio cycle after link loss or RX idle timeout. */
-static void _ns_wlan_reinit(const char *reason)
-{
-    printf("[WLAN] %s, reinitializing radio\n", reason);
-
-    _wlan_link_up = false;
-    _wlan_transport_connected = false;
-    _wlan_wake_replied = false;
-    _wlan_have_reliable_ack = false;
-
-    _ns_wlan_teardown();
-    _ns_wlan_refresh_wake();
-
-    while (!_ns_wlan_bringup())
-    {
-        printf("[WLAN] Re-init failed, retrying in 1s\n");
-        sleep_ms(1000);
-    }
-
-    _ns_wlan_touch_rx();
-}
+/* -------------------------------------------------------------------------- */
+/* Entry point                                                                */
+/* -------------------------------------------------------------------------- */
 
 void ns_wlan_enter(void)
 {
@@ -770,53 +375,50 @@ void ns_wlan_enter(void)
 
     /* USB identity to advertise to the dongle comes from NS-LIB-HID. The
      * library was configured with NS_TRANSPORT_USB so this lookup succeeds. */
-    if (!ns_hid_get_descriptor_params(NULL, NULL, NULL, NULL, &_wlan_vid, &_wlan_pid))
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    if (!ns_hid_get_descriptor_params(NULL, NULL, NULL, NULL, &vid, &pid))
     {
         printf("[WLAN] WARNING: could not read NS-LIB vid/pid; using 0/0\n");
     }
 
-    /* Destination for every reply: the dongle AP. */
-    IP4_ADDR(ip_2_ip4(&_wlan_dongle_addr),
-             NS_WLAN_DONGLE_IP0, NS_WLAN_DONGLE_IP1, NS_WLAN_DONGLE_IP2, NS_WLAN_DONGLE_IP3);
-    IP_SET_TYPE(&_wlan_dongle_addr, IPADDR_TYPE_V4);
-
-    /* Pick the first session id before any traffic flows. */
-    _ns_wlan_refresh_wake();
-
-    while (!_ns_wlan_bringup())
+    /* Platform owns radio bring-up + UDP bind (done once). The dongle library
+     * orchestrates (re)association from here via the connect/IP hooks. */
+    while (cyw43_arch_init())
     {
-        printf("[WLAN] Bring-up failed, retrying in 1s\n");
+        printf("[WLAN] cyw43_arch_init() failed, retrying in 1s\n");
         sleep_ms(1000);
     }
 
-    _ns_wlan_touch_rx();
+    while (!_ns_wlan_bind())
+    {
+        printf("[WLAN] Bind failed, retrying in 1s\n");
+        sleep_ms(1000);
+    }
+
+    /* Hand the personality to the library and pick the first session id.
+     * Event subscriptions decide which STATUS-derived callbacks fire: this
+     * example logs transport/player changes but has no haptic actuator, so it
+     * opts out of rumble events (the set_rumble hook is never invoked). */
+    dongle_cfg_gamepad_s cfg = {0};
+    cfg.mode = NS_WLAN_DONGLE_MODE;
+    cfg.vid  = vid;
+    cfg.pid  = pid;
+    cfg.evt.transport_status = true;
+    cfg.evt.player_number    = true;
+    cfg.evt.rumble           = false;
+    dongle_api_gamepad_wlan_init(&cfg);
 
     /*
-     * Reactive loop: the UDP receive callback only queues datagrams; here we
-     * drain that FIFO and run all protocol work (one reply per datagram), then
-     * service deferred flash writes, print throughput stats, and watch the
-     * Wi-Fi link so we can recover if the AP drops.
+     * Reactive loop: the UDP receive callback feeds the library (one reply per
+     * datagram); here we service deferred flash writes and let the library
+     * drive the connection state machine (link poll, reconnect, static IP).
      */
     for (;;)
     {
-
         ns_flash_task();
 
-        _ns_wlan_report_stats();
-
-        _ns_wlan_connect_poll();
-
-        int link = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
-        if (_wlan_sta_ready && link != CYW43_LINK_UP)
-        {
-            char reason[48];
-            snprintf(reason, sizeof(reason), "Link lost (status=%d)", link);
-            _ns_wlan_reinit(reason);
-        }
-        //else if (_wlan_sta_ready && _ns_wlan_rx_idle_expired())
-        //{
-        //    _ns_wlan_reinit("RX idle timeout (no packets for 5s)");
-        //}
+        dongle_api_gamepad_wlan_task();
 
         sleep_ms(1);
     }

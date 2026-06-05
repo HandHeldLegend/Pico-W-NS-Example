@@ -83,6 +83,10 @@ target_include_directories(Pico-W-NS-Example PRIVATE
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/external/NS-LIB-HID")
 
 # Import HOJA-LIB-DONGLE (shared wire types/constants for the WLAN dongle protocol).
+# Configure its debug output here, before the library is imported. The library
+# reads these variables and applies them to its own sources.
+set(DONGLE_LIB_DEBUG_LOG 1)
+set(DONGLE_LIB_DEBUG_GAMEPADSTATS 1)
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/external/HOJA-LIB-DONGLE")
 
 # Link the protocol/descriptor library used by both USB and Bluetooth transports.
