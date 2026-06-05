@@ -20,9 +20,9 @@
  * Addressing: the dongle's RX filter only accepts UDP from the gamepad address
  * 192.168.4.16. The dongle DHCP server is supposed to reserve that lease for
  * us, but it can hand out a different address (e.g. 192.168.4.17) if a stale
- * lease exists. To stay inside the dongle's filter, this transport does NOT
- * rely on the DHCP-assigned address: after association it pins the netif to the
- * fixed gamepad address (DONGLE_GAMEPAD_IP*) so our source IP is deterministic.
+ * lease exists. After association we keep the DHCP lease when it is already the
+ * gamepad address (DONGLE_GAMEPAD_IP*); otherwise we stop DHCP and pin the netif
+ * to that address so our source IP is deterministic.
  *
  * In Switch mode the dongle exposes a Nintendo Switch / NS HID USB device to
  * the console and tunnels the Switch protocol to us:
@@ -59,6 +59,11 @@
 #include "ns_lib.h"
 #include "dongle.h"
 
+uint16_t dongle_api_hook_get_rand_u16(void)
+{
+    return (uint16_t) (get_rand_32() & 0xFFFF);
+}
+
 /*
  * Compile-time guard from the guide's bring-up checklist (§14): with the
  * mandatory #pragma pack(push,1) the wire struct is exactly 71 bytes
@@ -83,9 +88,9 @@ _Static_assert(sizeof(dongle_pkt_s) == 71, "dongle_pkt_s must be packed to 71 by
 #define NS_WLAN_DONGLE_IP3      1
 
 /*
- * Our own (gamepad) address. The dongle filters on exactly this source IP, so
- * we assign it statically from the DONGLE_GAMEPAD_IP* constants rather than
- * accepting whatever DHCP hands out. The gateway is the dongle AP itself.
+ * Our own (gamepad) address. The dongle filters on exactly this source IP
+ * (DONGLE_GAMEPAD_IP*). We keep a correct DHCP lease; otherwise we pin it.
+ * The gateway is the dongle AP itself.
  */
 #define NS_WLAN_NETMASK0        255
 #define NS_WLAN_NETMASK1        255
@@ -94,6 +99,9 @@ _Static_assert(sizeof(dongle_pkt_s) == 71, "dongle_pkt_s must be packed to 71 by
 
 /* How long to wait for a single association attempt before retrying. */
 #define NS_WLAN_CONNECT_TIMEOUT_MS  20000
+
+/* Re-init the radio if no dongle datagrams arrive within this window. */
+#define NS_WLAN_RX_IDLE_TIMEOUT_MS  5000
 
 /*
  * USB personality we want the dongle to expose to the console. The dongle
@@ -115,6 +123,16 @@ static dongle_wake_s    _wlan_wake = {0};
 
 /* Last status snapshot delivered by the dongle (rumble / brake / player / link). */
 static dongle_status_s  _wlan_status = {0};
+
+/* True once STA association finished and static IP is pinned. */
+static bool             _wlan_sta_ready = false;
+
+/* Retry / attempt deadlines for non-blocking association (see _ns_wlan_connect_poll). */
+static absolute_time_t  _wlan_connect_deadline;
+static absolute_time_t  _wlan_retry_after;
+
+/* Updated on each valid RX datagram (background context); read from main loop. */
+static volatile uint32_t _wlan_last_rx_ms = 0;
 
 /* True once the dongle has started polling us (WLAN link, dongle side up). */
 static volatile bool    _wlan_link_up = false;
@@ -159,11 +177,6 @@ static bool             _wlan_have_reliable_ack = false;
 /* so no locking is needed as long as there is exactly one of each. The queue */
 /* holds NS_WLAN_RX_QUEUE_LEN slots, i.e. NS_WLAN_RX_QUEUE_LEN - 1 usable.    */
 /* -------------------------------------------------------------------------- */
-#define NS_WLAN_RX_QUEUE_LEN 32
-
-static dongle_pkt_s     _wlan_rx_queue[NS_WLAN_RX_QUEUE_LEN];
-static volatile uint32_t _wlan_rx_head = 0;     /* written only by the RX callback (producer). */
-static volatile uint32_t _wlan_rx_tail = 0;     /* written only by the main loop (consumer).   */
 static volatile uint32_t _wlan_rx_dropped = 0;  /* datagrams discarded because the queue was full. */
 
 /* -------------------------------------------------------------------------- */
@@ -186,6 +199,18 @@ static uint32_t _wlan_stat_last_dropped  = 0;   /* _wlan_rx_dropped at the last 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
+
+static void _ns_wlan_touch_rx(void)
+{
+    _wlan_last_rx_ms = to_ms_since_boot(get_absolute_time());
+}
+
+static bool _ns_wlan_rx_idle_expired(void)
+{
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    uint32_t last = _wlan_last_rx_ms;
+    return (now - last) >= NS_WLAN_RX_IDLE_TIMEOUT_MS;
+}
 
 /* Pick a fresh 12-bit session id (1..0xFFF). A new id tells the dongle that a
  * new client attached or the gamepad rebooted, forcing a clean core_init. */
@@ -444,6 +469,9 @@ static void _ns_wlan_process_packet(const dongle_pkt_s *rx)
 /* of datagrams queue up instead of forcing a reply (and an NS-LIB call) from */
 /* inside the network callback.                                               */
 /* -------------------------------------------------------------------------- */
+
+static dongle_pkt_s _rx_pkt;
+
 static void _ns_wlan_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                               const ip_addr_t *addr, u16_t port)
 {
@@ -467,43 +495,14 @@ static void _ns_wlan_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
         return;
     }
 
-    uint32_t head = _wlan_rx_head;
-    uint32_t next = (head + 1u) % NS_WLAN_RX_QUEUE_LEN;
-
-    /* next == tail means the ring is full (one slot is always kept empty). */
-    if (next == _wlan_rx_tail)
-    {
-        _wlan_rx_dropped++;
-        pbuf_free(p);
-        return;
-    }
-
-    pbuf_copy_partial(p, &_wlan_rx_queue[head], sizeof(dongle_pkt_s), 0);
+    pbuf_copy_partial(p, &_rx_pkt, sizeof(dongle_pkt_s), 0);
     pbuf_free(p);
 
-    /* Publish the slot only after it is fully written so the consumer never
-     * observes a half-filled entry. */
-    _wlan_rx_head = next;
-}
+    _ns_wlan_touch_rx();
+    _wlan_stat_rx_packets++;
 
-/* Drain the RX FIFO (consumer). Called from the main loop; processes every
- * datagram queued by the receive callback since the last pass, in order. */
-static void _ns_wlan_rx_task(void)
-{
-    while (_wlan_rx_tail != _wlan_rx_head)
-    {
-        uint32_t tail = _wlan_rx_tail;
-
-        /* Count every datagram drained from the host so the stats line can
-         * report the inbound receive rate alongside the outbound report rate. */
-        _wlan_stat_rx_packets++;
-
-        _ns_wlan_process_packet(&_wlan_rx_queue[tail]);
-
-        /* Release the slot only after processing so the producer cannot
-         * overwrite an entry we are still reading. */
-        _wlan_rx_tail = (tail + 1u) % NS_WLAN_RX_QUEUE_LEN;
-    }
+    // Process test
+    _ns_wlan_process_packet(&_rx_pkt);
 }
 
 /* Print a single, clean throughput line once per NS_WLAN_STATS_PERIOD_MS.
@@ -551,27 +550,51 @@ static void _ns_wlan_report_stats(void)
 /* -------------------------------------------------------------------------- */
 
 /*
- * Pin the station to the fixed gamepad address the dongle filters on. lwIP /
- * cyw43_arch start DHCP automatically on link-up, so we stop it and overwrite
- * the address here. After this our source IP is deterministic (192.168.4.16)
- * regardless of what the dongle DHCP server offered.
+ * Ensure the station uses the gamepad address the dongle filters on. lwIP /
+ * cyw43_arch run DHCP on link-up. dhcp_stop() always clears the netif, so we
+ * re-apply DONGLE_GAMEPAD_IP* afterward (a no-op when DHCP already offered it).
  */
 static void _ns_wlan_apply_static_ip(void)
 {
-    ip4_addr_t ip, mask, gw;
-    IP4_ADDR(&ip, DONGLE_GAMEPAD_IP0, DONGLE_GAMEPAD_IP1, DONGLE_GAMEPAD_IP2, DONGLE_GAMEPAD_IP3);
+    ip4_addr_t target, mask, gw;
+    IP4_ADDR(&target, DONGLE_GAMEPAD_IP0, DONGLE_GAMEPAD_IP1, DONGLE_GAMEPAD_IP2, DONGLE_GAMEPAD_IP3);
     IP4_ADDR(&mask, NS_WLAN_NETMASK0, NS_WLAN_NETMASK1, NS_WLAN_NETMASK2, NS_WLAN_NETMASK3);
     IP4_ADDR(&gw, NS_WLAN_DONGLE_IP0, NS_WLAN_DONGLE_IP1, NS_WLAN_DONGLE_IP2, NS_WLAN_DONGLE_IP3);
 
     struct netif *nif = netif_default;
-    if (nif != NULL)
+    if (nif == NULL)
     {
-        dhcp_stop(nif);
-        netif_set_addr(nif, &ip, &mask, &gw);
+        return;
+    }
+
+    const ip4_addr_t *current = netif_ip4_addr(nif);
+    bool dhcp_had_target = ip4_addr_cmp(current, &target);
+
+    if (!dhcp_had_target)
+    {
+        printf("[WLAN] Associated (DHCP offered %s), pinning gamepad IP\n", ip4addr_ntoa(current));
+    }
+
+    /*
+     * dhcp_stop() sends RELEASE and clears the netif to 0.0.0.0, so we must
+     * always re-apply the gamepad address afterward even when DHCP already
+     * offered the correct lease.
+     */
+    dhcp_stop(nif);
+    netif_set_addr(nif, &target, &mask, &gw);
+
+    if (dhcp_had_target)
+    {
+        printf("[WLAN] Associated (kept DHCP gamepad IP %s)\n", ip4addr_ntoa(netif_ip4_addr(nif)));
+    }
+    else
+    {
+        printf("[WLAN] Using static gamepad IP %s (gw 192.168.4.1)\n", ip4addr_ntoa(netif_ip4_addr(nif)));
     }
 }
 
-/* Join the dongle AP, retrying until it succeeds, then pin our static IP. */
+/* Start a non-blocking join to the dongle AP. Completion (static IP, PM) is handled
+ * by _ns_wlan_connect_poll() from the main loop. */
 static void _ns_wlan_connect(void)
 {
     cyw43_arch_enable_sta_mode();
@@ -580,33 +603,76 @@ static void _ns_wlan_connect(void)
 
     printf("[WLAN] Station mode enabled, joining SSID \"%s\"\n", NS_WLAN_SSID);
 
-    for (;;)
-    {
-        printf("[WLAN] Associating...\n");
-        int rc = cyw43_arch_wifi_connect_timeout_ms(NS_WLAN_SSID, NS_WLAN_PASSWORD,
-                                                     NS_WLAN_AUTH, NS_WLAN_CONNECT_TIMEOUT_MS);
-        if (rc == 0)
-        {
-            break;
-        }
+    _wlan_sta_ready = false;
+    _wlan_retry_after = get_absolute_time();
+    _wlan_connect_deadline = make_timeout_time_ms(NS_WLAN_CONNECT_TIMEOUT_MS);
 
-        printf("[WLAN] Association failed (rc=%d), retrying in 1s\n", rc);
-        sleep_ms(1000);
+    printf("[WLAN] Associating...\n");
+    int rc = cyw43_arch_wifi_connect_async(NS_WLAN_SSID, NS_WLAN_PASSWORD, NS_WLAN_AUTH);
+    if (rc != 0)
+    {
+        printf("[WLAN] connect_async failed (rc=%d)\n", rc);
+    }
+}
+
+/* Drive async association: pin static IP on LINK_UP; retry on failure / timeout. */
+static void _ns_wlan_connect_poll(void)
+{
+    int link = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+
+    if (link == CYW43_LINK_UP)
+    {
+        if (!_wlan_sta_ready)
+        {
+            _ns_wlan_apply_static_ip();
+
+            cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);
+            _wlan_sta_ready = true;
+            _ns_wlan_touch_rx();
+        }
+        return;
     }
 
-    /*
-     * Associated. Discard any DHCP lease and assign the address the dongle
-     * expects, so our datagrams pass its source-IP filter (192.168.4.16).
-     */
-    const ip4_addr_t *dhcp_ip = netif_ip4_addr(netif_default);
-    printf("[WLAN] Associated (DHCP offered %s)\n", ip4addr_ntoa(dhcp_ip));
+    if (_wlan_sta_ready)
+    {
+        return;
+    }
 
-    _ns_wlan_apply_static_ip();
+    if (!time_reached(_wlan_retry_after))
+    {
+        return;
+    }
 
-    const ip4_addr_t *ip = netif_ip4_addr(netif_default);
-    printf("[WLAN] Using static gamepad IP %s (gw 192.168.4.1)\n", ip4addr_ntoa(ip));
+    bool retry = false;
+    if (link == CYW43_LINK_NONET)
+    {
+        retry = true;
+    }
+    else if (link == CYW43_LINK_FAIL || link == CYW43_LINK_BADAUTH)
+    {
+        printf("[WLAN] Association failed (status=%d), retrying in 1s\n", link);
+        retry = true;
+    }
+    else if (time_reached(_wlan_connect_deadline))
+    {
+        printf("[WLAN] Association timeout, retrying\n");
+        retry = true;
+    }
 
-    cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);
+    if (!retry)
+    {
+        return;
+    }
+
+    printf("[WLAN] Associating...\n");
+    int rc = cyw43_arch_wifi_connect_async(NS_WLAN_SSID, NS_WLAN_PASSWORD, NS_WLAN_AUTH);
+    if (rc != 0)
+    {
+        printf("[WLAN] connect_async failed (rc=%d)\n", rc);
+    }
+
+    _wlan_retry_after = make_timeout_time_ms(1000);
+    _wlan_connect_deadline = make_timeout_time_ms(NS_WLAN_CONNECT_TIMEOUT_MS);
 }
 
 /* Bind UDP port 4444 and register the receive callback. */
@@ -645,9 +711,9 @@ static void _ns_wlan_unbind(void)
     }
 }
 
-/* Full radio bring-up: init the cyw43 driver, associate to the dongle AP, pin
- * our static IP, and bind UDP. Returns false (after cleaning up) if init or
- * bind fails; association itself retries internally until it succeeds. */
+/* Full radio bring-up: init the cyw43 driver, start async association, and bind
+ * UDP. Returns false (after cleaning up) if init or bind fails; association
+ * completes in the main loop via _ns_wlan_connect_poll(). */
 static bool _ns_wlan_bringup(void)
 {
     if (cyw43_arch_init())
@@ -671,8 +737,31 @@ static bool _ns_wlan_bringup(void)
  * driver. Pairs with _ns_wlan_bringup() for a clean re-initialization. */
 static void _ns_wlan_teardown(void)
 {
+    _wlan_sta_ready = false;
     _ns_wlan_unbind();
     cyw43_arch_deinit();
+}
+
+/* Full radio cycle after link loss or RX idle timeout. */
+static void _ns_wlan_reinit(const char *reason)
+{
+    printf("[WLAN] %s, reinitializing radio\n", reason);
+
+    _wlan_link_up = false;
+    _wlan_transport_connected = false;
+    _wlan_wake_replied = false;
+    _wlan_have_reliable_ack = false;
+
+    _ns_wlan_teardown();
+    _ns_wlan_refresh_wake();
+
+    while (!_ns_wlan_bringup())
+    {
+        printf("[WLAN] Re-init failed, retrying in 1s\n");
+        sleep_ms(1000);
+    }
+
+    _ns_wlan_touch_rx();
 }
 
 void ns_wlan_enter(void)
@@ -700,6 +789,8 @@ void ns_wlan_enter(void)
         sleep_ms(1000);
     }
 
+    _ns_wlan_touch_rx();
+
     /*
      * Reactive loop: the UDP receive callback only queues datagrams; here we
      * drain that FIFO and run all protocol work (one reply per datagram), then
@@ -708,42 +799,24 @@ void ns_wlan_enter(void)
      */
     for (;;)
     {
-        _ns_wlan_rx_task();
 
         ns_flash_task();
 
         _ns_wlan_report_stats();
 
+        _ns_wlan_connect_poll();
+
         int link = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
-        if (link != CYW43_LINK_UP)
+        if (_wlan_sta_ready && link != CYW43_LINK_UP)
         {
-            printf("[WLAN] Link lost (status=%d), reinitializing radio\n", link);
-            _wlan_link_up = false;
-            _wlan_transport_connected = false;
-            _wlan_wake_replied = false;
-            _wlan_have_reliable_ack = false;
-
-            /* Drop anything still queued from the old session so the fresh
-             * session never replies to stale datagrams. The producer is idle
-             * while the link is down, so resetting both indices is safe. */
-            _wlan_rx_tail = _wlan_rx_head;
-
-            /*
-             * A dropped link is recovered by fully cycling the radio: bring the
-             * cyw43 driver all the way down and re-initialize it, rather than
-             * just re-associating on the existing instance. This clears any
-             * wedged driver/netif state. A reconnect is also a new logical
-             * session per the protocol guide, so refresh the session id.
-             */
-            _ns_wlan_teardown();
-            _ns_wlan_refresh_wake();
-
-            while (!_ns_wlan_bringup())
-            {
-                printf("[WLAN] Re-init failed, retrying in 1s\n");
-                sleep_ms(1000);
-            }
+            char reason[48];
+            snprintf(reason, sizeof(reason), "Link lost (status=%d)", link);
+            _ns_wlan_reinit(reason);
         }
+        //else if (_wlan_sta_ready && _ns_wlan_rx_idle_expired())
+        //{
+        //    _ns_wlan_reinit("RX idle timeout (no packets for 5s)");
+        //}
 
         sleep_ms(1);
     }

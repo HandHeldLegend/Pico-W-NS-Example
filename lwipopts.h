@@ -49,9 +49,9 @@
 #define LWIP_DHCP                   1
 
 /*
- * DHCP is enabled so the cyw43_arch blocking connect can reach LINK_UP, but
- * ns_wlan.c immediately stops DHCP and pins the fixed gamepad address
- * (192.168.4.16) the dongle filters on. Skip the ARP probe delay either way.
+ * DHCP is enabled so cyw43_arch can reach LINK_UP. ns_wlan.c keeps a correct
+ * gamepad lease (192.168.4.16) or stops DHCP and pins that address. Skip the
+ * ARP probe delay either way.
  */
 #define DHCP_DOES_ARP_CHECK         0
 #define LWIP_DHCP_DOES_ACD_CHECK    0
